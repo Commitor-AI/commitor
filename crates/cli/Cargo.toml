@@ -1,0 +1,9 @@
+[package]
+name = "commitor"
+version = "0.1.0"
+edition = "2021"
+description = "Commitor CLI — catches unrelated changes before they get buried in a commit"
+
+[dependencies]
+anyhow = "1"
+engine = { path = "../engine" }

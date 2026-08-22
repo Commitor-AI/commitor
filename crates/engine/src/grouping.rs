@@ -81,11 +81,7 @@ pub fn group_files_locally(changed_files: &[String]) -> GroupingResult {
     let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     for file in changed_files {
-        let dir = file
-            .split('/')
-            .next()
-            .unwrap_or("root")
-            .to_string();
+        let dir = file.split('/').next().unwrap_or("root").to_string();
         groups.entry(dir).or_default().push(file.clone());
     }
 
@@ -212,7 +208,10 @@ mod tests {
         assert!(messages.contains(&"chore: update 1 file(s) in tests"));
         assert!(messages.contains(&"chore: update 1 file(s) in README.md"));
 
-        assert_eq!(result.summary, "locally grouped 4 file(s) by top-level directory");
+        assert_eq!(
+            result.summary,
+            "locally grouped 4 file(s) by top-level directory"
+        );
     }
 
     #[test]
@@ -220,7 +219,10 @@ mod tests {
         let files: Vec<String> = vec!["Cargo.toml".into()];
         let result = group_files_locally(&files);
         assert_eq!(result.commits.len(), 1);
-        assert_eq!(result.commits[0].message, "chore: update 1 file(s) in Cargo.toml");
+        assert_eq!(
+            result.commits[0].message,
+            "chore: update 1 file(s) in Cargo.toml"
+        );
         assert_eq!(result.commits[0].files, vec!["Cargo.toml"]);
     }
 
@@ -228,6 +230,9 @@ mod tests {
     fn local_grouping_empty_input() {
         let result = group_files_locally(&[]);
         assert!(result.commits.is_empty());
-        assert_eq!(result.summary, "locally grouped 0 file(s) by top-level directory");
+        assert_eq!(
+            result.summary,
+            "locally grouped 0 file(s) by top-level directory"
+        );
     }
 }
