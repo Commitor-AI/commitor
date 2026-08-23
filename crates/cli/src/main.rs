@@ -4,7 +4,9 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+mod analysis;
 mod auth;
+mod commit;
 mod config;
 mod engine;
 mod heuristics;
@@ -46,6 +48,12 @@ enum Commands {
         /// Print machine-readable JSON instead of a formatted report
         #[arg(long)]
         json: bool,
+    },
+    /// Analyze the working diff and create the approved git commits
+    Commit {
+        /// Plan commits from unstaged changes instead of staged ones
+        #[arg(long)]
+        all: bool,
     },
     /// Update commitor to the latest release
     Update,
@@ -91,7 +99,11 @@ fn main() -> ExitCode {
 fn is_server_facing(command: &Commands) -> bool {
     matches!(
         command,
-        Commands::Login { .. } | Commands::Logout | Commands::Whoami | Commands::Scan { .. }
+        Commands::Login { .. }
+            | Commands::Logout
+            | Commands::Whoami
+            | Commands::Scan { .. }
+            | Commands::Commit { .. }
     )
 }
 
@@ -111,6 +123,9 @@ fn execute(command: Commands) -> Result<ExitCode, Option<anyhow::Error>> {
             strict,
             json,
         }).map_err(Some),
+        Commands::Commit { all } => {
+            commit::run(commit::CommitFlags { all }).map_err(Some)
+        }
         Commands::Update => run_update().map(|_| ExitCode::SUCCESS).map_err(Some),
     }
 }
