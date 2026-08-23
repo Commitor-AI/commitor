@@ -1,0 +1,265 @@
+//! Login/session management for the Commitor CLI.
+//!
+//! Users create API keys in the web dashboard; the CLI stores the key
+//! locally and attaches it as `Authorization: Bearer <key>` on every
+//! request to the Commitor backend.
+//!
+//! The backend base URL defaults to a local development server and can
+//! be overridden with `COMMITOR_API_URL` (no recompile needed when the
+//! hosted API ships).
+
+use std::fs;
+use std::path::PathBuf;
+
+use anyhow::{bail, Context, Result};
+use reqwest::blocking::{Client, RequestBuilder, Response};
+use serde::{Deserialize, Serialize};
+
+use crate::config;
+
+/// Where users manage their keys — shown in error messages.
+pub const DASHBOARD_URL: &str = "https://commitor.dev/dashboard";
+
+/// Seconds before an API call gives up.
+const API_TIMEOUT_SECS: u64 = 15;
+
+#[derive(Serialize, Deserialize)]
+struct StoredCredentials {
+    api_key: String,
+}
+
+/// Response of `GET /auth/me`.
+#[derive(Debug, Deserialize)]
+struct MeResponse {
+    email: String,
+    plan: Option<String>,
+}
+
+/// Backend base URL, e.g. `http://localhost:8000` (no trailing slash).
+fn api_base_url() -> String {
+    config::api_base_url()
+}
+
+fn credentials_path() -> Result<PathBuf> {
+    let home = home_dir().context("could not locate your home directory")?;
+    Ok(home.join(".commitor").join("credentials.toml"))
+}
+
+#[cfg(unix)]
+fn home_dir() -> Result<PathBuf> {
+    let home =
+        std::env::var("HOME").context("HOME is not set — where should credentials be stored?")?;
+    Ok(PathBuf::from(home))
+}
+
+#[cfg(windows)]
+fn home_dir() -> Result<PathBuf> {
+    let profile = std::env::var("USERPROFILE")
+        .context("USERPROFILE is not set — where should credentials be stored?")?;
+    Ok(PathBuf::from(profile))
+}
+
+/// The exact message shown when a command needs credentials and none
+/// are stored.
+fn not_logged_in_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "Not logged in. Run `commitor login --key <your-key>` — get a key at {DASHBOARD_URL}"
+    )
+}
+
+/// Load the stored API key.
+///
+/// This is what other (future) commands call to authenticate: pair it
+/// with [`authorized`] to attach the bearer header to any request.
+pub fn load_api_key() -> Result<String> {
+    let path = credentials_path()?;
+    let raw = fs::read_to_string(&path).map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => not_logged_in_error(),
+        _ => anyhow::Error::new(err)
+            .context(format!("failed to read {}", path.display())),
+    })?;
+
+    let creds: StoredCredentials = toml::from_str(&raw)
+        .with_context(|| format!("{} is not valid TOML", path.display()))?;
+
+    let key = creds.api_key.trim().to_string();
+    if key.is_empty() {
+        bail!("{} has an empty api_key — log in again to fix it", path.display());
+    }
+    Ok(key)
+}
+
+/// Attach `Authorization: Bearer <stored-key>` to a request.
+///
+/// Implemented for both the blocking and the async reqwest request
+/// builders, so every authenticated command can route its requests
+/// through this one helper.
+pub trait WithBearer {
+    fn set_bearer(self, api_key: &str) -> Self;
+}
+
+impl WithBearer for RequestBuilder {
+    fn set_bearer(self, api_key: &str) -> Self {
+        self.bearer_auth(api_key)
+    }
+}
+
+impl WithBearer for reqwest::RequestBuilder {
+    fn set_bearer(self, api_key: &str) -> Self {
+        self.bearer_auth(api_key)
+    }
+}
+
+/// Attach an already-loaded API key as `Authorization: Bearer` to a
+/// request builder (blocking or async).
+pub fn with_key<B: WithBearer>(request: B, api_key: &str) -> B {
+    request.set_bearer(api_key)
+}
+
+/// Load the stored key and attach it as `Authorization: Bearer` to a
+/// request builder.
+///
+/// This is the entry point future authenticated commands should use.
+/// Fails with the standard not-logged-in message when no credentials
+/// are stored.
+#[allow(dead_code)]
+pub fn authorized<B: WithBearer>(request: B) -> Result<B> {
+    let api_key = load_api_key()?;
+    Ok(with_key(request, &api_key))
+}
+
+/// Validate `api_key` against `GET /auth/me`, returning the account.
+fn fetch_me(api_key: &str) -> Result<MeResponse> {
+    let url = format!("{}/auth/me", api_base_url());
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(API_TIMEOUT_SECS))
+        .build()
+        .context("failed to set up HTTP client")?;
+
+    let response = match with_key(client.get(&url), api_key).send() {
+        Ok(response) => response,
+        Err(err) => bail!(
+            "Couldn't reach the Commitor API at {url} ({}). \
+             Is your server running? Set COMMITOR_API_URL if it lives elsewhere.",
+            root_cause(&err)
+        ),
+    };
+
+    check_auth_status(response, &url)
+}
+
+/// The deepest error in a chain, e.g. `Connection refused (os error
+/// 111)` — the part a human can actually act on.
+pub fn root_cause(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut latest = err.to_string();
+    let mut current = err.source();
+    while let Some(source) = current {
+        latest = source.to_string();
+        current = source.source();
+    }
+    latest
+}
+
+/// Map non-success statuses onto friendly messages shared by
+/// `login --key` and `whoami`.
+fn check_auth_status(response: Response, url: &str) -> Result<MeResponse> {
+    let status = response.status();
+    match status.as_u16() {
+        200 => response
+            .json()
+            .with_context(|| format!("{url} returned a malformed /auth/me response")),
+        401 | 403 => bail!(
+            "That API key was rejected by the backend (HTTP {status}).\n\
+             Double-check it, or generate a new one at {DASHBOARD_URL}"
+        ),
+        404 => bail!(
+            "{url} has no /auth/me endpoint — is COMMITOR_API_URL pointing at the right server?"
+        ),
+        _ => {
+            let body = response.text().unwrap_or_default();
+            let snippet: String = body.chars().take(200).collect();
+            if snippet.is_empty() {
+                bail!("Commitor API returned HTTP {status} for {url}");
+            }
+            bail!("Commitor API returned HTTP {status} for {url}\nServer said: {snippet}");
+        }
+    }
+}
+
+/// Validate the key against the backend and store it on success.
+pub fn login(raw_key: &str) -> Result<()> {
+    let api_key = raw_key.trim().to_string();
+    if api_key.is_empty() {
+        bail!("The --key value is empty — pass the key from {DASHBOARD_URL}");
+    }
+
+    println!("Validating key against {}…", api_base_url());
+    let me = fetch_me(&api_key)?;
+
+    save_credentials(&api_key)?;
+
+    let plan = me.plan.unwrap_or_else(|| "free".to_string());
+    println!("Logged in as {} ({plan} plan).", me.email);
+    let path = credentials_path()
+        .unwrap_or_else(|_| PathBuf::from("~/.commitor/credentials.toml"));
+    println!("Credentials stored at {}", path.display());
+    Ok(())
+}
+
+fn save_credentials(api_key: &str) -> Result<()> {
+    let path = credentials_path()?;
+    let dir = path
+        .parent()
+        .context("credentials path has no parent directory")?
+        .to_path_buf();
+
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to restrict permissions on {}", dir.display()))?;
+    }
+
+    let body = toml::to_string_pretty(&StoredCredentials {
+        api_key: api_key.to_string(),
+    })
+    .context("failed to serialize credentials")?;
+
+    fs::write(&path, body).with_context(|| format!("failed to write {}", path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to restrict permissions on {}", path.display()))?;
+    }
+
+    Ok(())
+}
+
+/// Remove the stored credentials file, if any.
+pub fn logout() -> Result<()> {
+    let path = credentials_path()?;
+    match fs::remove_file(&path) {
+        Ok(()) => println!("Logged out. Deleted {}.", path.display()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            println!("You weren't logged in — nothing to remove.")
+        }
+        Err(err) => {
+            return Err(anyhow::Error::new(err)
+                .context(format!("failed to delete {}", path.display())))
+        }
+    }
+    Ok(())
+}
+
+/// Print the email + plan behind the stored key.
+pub fn whoami() -> Result<()> {
+    let api_key = load_api_key()?;
+    let me = fetch_me(&api_key)?;
+    let plan = me.plan.unwrap_or_else(|| "free".to_string());
+    println!("{} — {} plan", me.email, plan);
+    Ok(())
+}

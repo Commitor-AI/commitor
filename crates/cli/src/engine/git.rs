@@ -28,6 +28,31 @@ pub fn get_branch_diff(base: &str) -> Result<String> {
     run_git(&["diff", &format!("{base}...HEAD")])
 }
 
+/// The full patch text of one diff flavor: staged when `staged`,
+/// unstaged (working tree) otherwise.
+pub fn diff_patch(staged: bool) -> Result<String> {
+    if staged {
+        run_git(&["diff", "--staged"])
+    } else {
+        run_git(&["diff"])
+    }
+}
+
+/// Changed file paths for one diff flavor, one per line.
+pub fn changed_files(staged: bool) -> Result<Vec<String>> {
+    let out = if staged {
+        run_git(&["diff", "--staged", "--name-only"])?
+    } else {
+        run_git(&["diff", "--name-only"])?
+    };
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 fn run_git(args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .args(args)
