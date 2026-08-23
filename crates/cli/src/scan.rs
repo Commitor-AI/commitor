@@ -26,7 +26,9 @@ pub struct ScanFlags {
 
 pub fn run(flags: ScanFlags) -> Result<ExitCode> {
     // ── 1. Collect the diff ─────────────────────────────────────────
-    let collected = analysis::collect_diff(flags.all)?;
+    // Scan deliberately ignores untracked files — its scope is the
+    // tracked working diff (`commit` opts into untracked files).
+    let collected = analysis::collect_diff(flags.all, false)?;
     if collected.files.is_empty() {
         println!("Nothing to scan — no staged or unstaged changes.");
         return Ok(ExitCode::SUCCESS);
