@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 While the project is in 0.x, minor versions may add, change, or remove
 functionality freely; 1.0.0 marks a stable command surface.
 
+## [0.2.0] — 2026-08-23
+
+The core commands land: Commitor can now analyze your working diff and,
+with your approval, turn it into clean commits.
+
+### Added
+
+- `commitor login --key <key>` / `logout` / `whoami` — API-key
+  authentication against the Commitor backend.
+- `commitor scan` — read-only analysis of the working diff (staged by
+  default, `--all` for unstaged). Local heuristics run first; only
+  inconclusive changesets are sent to the backend's `/analyze`
+  endpoint. Supports `--offline`, `--strict` (non-zero exit when mixed,
+  for pre-commit hooks/CI) and `--json`.
+- `commitor commit` — turns the analyzed diff into real git commits
+  after you approve every message:
+  - whole-file splitting into per-topic commits,
+  - **hunk-level splitting** when a single file contains unrelated
+    changes (`git apply --cached` staging),
+  - untracked files are analyzed and planned too (synthesized as
+    new-file diffs; the index is never touched during analysis),
+  - **coverage guarantee**: before anything runs, the plan must
+    account for every changed line exactly once — plans that lose or
+    double-assign changes are refused instead of committed,
+  - all-or-nothing approval with editable messages; partial failures
+    stop immediately and report exactly what landed and what didn't
+    (no automatic rollback).
+- Server-facing commands now verify the CLI is current before running
+  (same once-a-day update gate as before).
+
+### Changed
+
+- Crate description updated to reflect actual functionality.
+
 ## [0.1.0] — 2026-08-23
 
 Initial public release — an early preview of the distribution pipeline,
@@ -28,4 +62,5 @@ not of the full tool.
 - `commitor scan` and `commitor commit` — in active development,
   coming in future 0.x releases.
 
+[0.2.0]: https://github.com/Commitor-AI/commitor/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Commitor-AI/commitor/releases/tag/v0.1.0

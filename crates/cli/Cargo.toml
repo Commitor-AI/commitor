@@ -1,8 +1,8 @@
 [package]
 name = "commitor-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Catches unrelated changes bundled into commits and splits them cleanly; early release with installer and self-update only"
+description = "Catches unrelated changes bundled into commits and splits them cleanly — whole-file or hunk-level, guided by AI analysis"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Commitor-AI/commitor"
 readme = "../../README.md"
