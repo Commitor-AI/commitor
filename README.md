@@ -4,22 +4,60 @@ Commitor is a command-line companion for git that catches unrelated changes
 bundled into a single commit and helps you split them cleanly — so `git log`
 stays readable and every commit tells one story.
 
-> **Status: early preview (0.x).** The distribution pipeline (installer,
-> self-updater, release binaries) is live; the core `scan` and `commit`
-> commands are in active development and will land in upcoming 0.x releases.
-> The project stays on 0.x until that surface stabilizes.
+> **Status: early preview (0.x).** The core `scan` and `commit` commands are
+> live as of 0.2.0. The project stays on 0.x until the command surface
+> stabilizes.
+
+## How it works
+
+1. **Stage (or modify) your changes** as usual.
+2. Run `commitor scan` for a read-only opinion: is this one logical change,
+   or several unrelated ones bundled together?
+3. Run `commitor commit` to act on it. Commitor analyzes the diff — including
+   untracked files — proposes either a single message or a split plan, and
+   creates the commits **only after you approve them**, with editable messages.
+
+Splitting is smart about granularity: whole files are grouped by topic, and
+when a single file itself contains two unrelated changes, it is split at the
+hunk level. Before anything runs, the proposed plan must account for every
+changed line exactly once — a plan that loses or double-assigns changes is
+refused rather than committed.
 
 ## Current functionality
 
-Right now the CLI ships with self-update machinery only:
-
 | Command | Description |
 |---|---|
+| `commitor login --key <key>` | Validate an API key against the backend and store it locally |
+| `commitor logout` | Delete the stored credentials |
+| `commitor whoami` | Show the account and plan behind the stored key |
+| `commitor scan` | Analyze the working diff for unrelated changes (read-only) |
+| `commitor commit` | Split the diff into AI-planned git commits you approve |
 | `commitor update` | Check GitHub for a newer release and install it |
 | `commitor version` | Print the installed version (`--version`, `-V` also work) |
 | `commitor help` | Show usage help |
 
-Once an update has been discovered, Commitor refuses to run other commands
+### scan flags
+
+| Flag | Effect |
+|---|---|
+| `--all` | Scan unstaged changes instead of staged ones |
+| `--offline` | Only run local heuristics; never call the backend |
+| `--strict` | Exit non-zero when the commit looks mixed (CI / pre-commit hooks) |
+| `--json` | Print machine-readable JSON instead of a formatted report |
+
+### commit flags
+
+| Flag | Effect |
+|---|---|
+| `--all` | Plan commits from unstaged changes instead of staged ones |
+
+`scan` and `commit` need a backend account (`commitor login --key <key>` —
+get a key at [commitor.dev/dashboard](https://commitor.dev/dashboard)).
+`scan` only calls the backend when local heuristics can't confidently call
+the changeset one logical change; `commit` always does, because every commit
+message comes from the analysis.
+
+Once an update has been discovered, server-facing commands refuse to run
 until you install it with `commitor update` — this keeps everyone on a
 current build while the command surface is small. Set
 `COMMITOR_ALLOW_OUTDATED=1` to bypass that check if you must.
@@ -68,8 +106,11 @@ before replacing its own binary.
 
 ## Roadmap
 
-- `commitor scan` — detect unrelated changes staged for one commit *(in development)*
-- `commitor commit` — split them into clean, well-scoped commits *(in development)*
+- Hosted backend generally available (today the backend location defaults to
+  a local development server; override with `COMMITOR_API_URL`)
+- Hunk-level splitting for exotic paths (quoted/escaped filenames are
+  currently refused rather than split)
+- PR-review command (`commitor pr`) comparing a branch against its base
 
 ## License
 

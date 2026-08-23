@@ -1,10 +1,10 @@
-// These modules are the core scan/commit engine. Nothing in the CLI
-// calls them yet — they are wired up when those commands land — so
-// dead_code is expected and allowed until then.
+// These modules are the core scan/commit engine. `git` and `hunks`
+// are called by the analysis/commit paths; gemini/grouping remain
+// unwired, so dead_code is expected and allowed until then.
 #[allow(dead_code)]
 pub mod gemini;
-#[allow(dead_code)]
 pub mod git;
+pub mod hunks;
 #[allow(dead_code)]
 pub mod grouping;
 

@@ -2,50 +2,92 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
 
+mod analysis;
+mod auth;
+mod commit;
+mod config;
 mod engine;
+mod heuristics;
+mod scan;
 
 use engine::update;
 
-const USAGE: &str = "commitor — catch unrelated changes before they get buried
+/// Catch unrelated changes before they get buried
+#[derive(Parser)]
+#[command(name = "commitor", version, about = "Catch unrelated changes before they get buried")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
 
-Usage: commitor <COMMAND>
-
-Commands:
-  update     Update commitor to the latest release
-  version    Print the installed version (also: --version, -V)
-
-Options:
-  -h, --help  Show this help";
+#[derive(Subcommand)]
+enum Commands {
+    /// Validate an API key against the backend and store it locally
+    Login {
+        /// API key from https://commitor.dev/dashboard
+        #[arg(long)]
+        key: String,
+    },
+    /// Delete the locally stored credentials
+    Logout,
+    /// Show the account and plan behind the stored API key
+    Whoami,
+    /// Analyze the working diff for unrelated changes (read-only)
+    Scan {
+        /// Scan unstaged changes instead of staged ones
+        #[arg(long)]
+        all: bool,
+        /// Only run local heuristics; never call the backend
+        #[arg(long)]
+        offline: bool,
+        /// Exit non-zero when the commit looks mixed (CI / pre-commit)
+        #[arg(long)]
+        strict: bool,
+        /// Print machine-readable JSON instead of a formatted report
+        #[arg(long)]
+        json: bool,
+    },
+    /// Analyze the working diff and create the approved git commits
+    Commit {
+        /// Plan commits from unstaged changes instead of staged ones
+        #[arg(long)]
+        all: bool,
+    },
+    /// Update commitor to the latest release
+    Update,
+}
 
 fn main() -> ExitCode {
     // A previous Windows self-update may have left `<exe>.old` behind.
     update::cleanup_stale_old_binary();
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let command = args.first().map(String::as_str);
+    let cli = Cli::parse();
 
-    let result: Result<(), Option<anyhow::Error>> =
-        if let Some(cmd) = command.filter(|cmd| !gate_exempt(Some(cmd))) {
-            run_gated_command(cmd)
-        } else {
-            match command {
-                None | Some("-h" | "--help" | "help") => {
-                    println!("{USAGE}");
-                    Ok(())
+    // Server-facing commands only run when the CLI is current; pure
+    // info commands (`version`, help) and the self-updater stay
+    // available regardless.
+    let result: Result<ExitCode, Option<anyhow::Error>> =
+        if is_server_facing(&cli.command) {
+            match enforce_up_to_date() {
+                Ok(None) => execute(cli.command),
+                Ok(Some(latest)) => {
+                    eprintln!("error: commitor {latest} is available and must be installed first");
+                    eprintln!();
+                    eprintln!("Run `commitor update` to install it, then retry your command.");
+                    eprintln!("Set COMMITOR_ALLOW_OUTDATED=1 to bypass this check at your own risk.");
+                    Err(None)
                 }
-                Some("update") => run_update().map_err(Some),
-                Some("--version" | "-V" | "version") => {
-                    println!("commitor v{}", update::current_version());
-                    Ok(())
-                }
-                _ => unreachable!("gate_exempt() covers every arm above"),
+                Err(err) => Err(Some(err)),
             }
+        } else {
+            execute(cli.command)
         };
 
     // `Err(None)` means the failure was already reported to stderr.
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(Some(err)) => {
             eprintln!("error: {err:#}");
             ExitCode::FAILURE
@@ -54,15 +96,38 @@ fn main() -> ExitCode {
     }
 }
 
-/// Commands that stay available while an update is pending: the
-/// self-updater itself plus harmless informational commands.
-fn gate_exempt(command: Option<&str>) -> bool {
+fn is_server_facing(command: &Commands) -> bool {
     matches!(
         command,
-        None | Some("-h" | "--help" | "help")
-            | Some("update")
-            | Some("--version" | "-V" | "version")
+        Commands::Login { .. }
+            | Commands::Logout
+            | Commands::Whoami
+            | Commands::Scan { .. }
+            | Commands::Commit { .. }
     )
+}
+
+fn execute(command: Commands) -> Result<ExitCode, Option<anyhow::Error>> {
+    match command {
+        Commands::Login { key } => auth::login(&key).map(|_| ExitCode::SUCCESS).map_err(Some),
+        Commands::Logout => auth::logout().map(|_| ExitCode::SUCCESS).map_err(Some),
+        Commands::Whoami => auth::whoami().map(|_| ExitCode::SUCCESS).map_err(Some),
+        Commands::Scan {
+            all,
+            offline,
+            strict,
+            json,
+        } => scan::run(scan::ScanFlags {
+            all,
+            offline,
+            strict,
+            json,
+        }).map_err(Some),
+        Commands::Commit { all } => {
+            commit::run(commit::CommitFlags { all }).map_err(Some)
+        }
+        Commands::Update => run_update().map(|_| ExitCode::SUCCESS).map_err(Some),
+    }
 }
 
 /// Escape hatch for users the updater cannot serve (no matching asset,
@@ -71,31 +136,6 @@ fn allow_outdated() -> bool {
     std::env::var("COMMITOR_ALLOW_OUTDATED")
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false)
-}
-
-/// Run a real (non-exempt) command.
-///
-/// Nothing executes until [`enforce_up_to_date`] confirms the CLI is
-/// current: once an update is known to exist, work is refused until
-/// the user runs `commitor update`.
-fn run_gated_command(command: &str) -> Result<(), Option<anyhow::Error>> {
-    match enforce_up_to_date() {
-        Ok(None) => {}
-        Ok(Some(latest)) => {
-            eprintln!("error: commitor {latest} is available and must be installed first");
-            eprintln!();
-            eprintln!("Run `commitor update` to install it, then retry your command.");
-            eprintln!("Set COMMITOR_ALLOW_OUTDATED=1 to bypass this check at your own risk.");
-            return Err(None);
-        }
-        Err(err) => return Err(Some(err)),
-    }
-
-    // Future work commands plug in here — they are guaranteed to be
-    // up to date by the gate above.
-    eprintln!("error: unknown command `{command}`\n");
-    eprintln!("{USAGE}");
-    Err(None)
 }
 
 /// Make sure no newer release is pending before the caller proceeds.
