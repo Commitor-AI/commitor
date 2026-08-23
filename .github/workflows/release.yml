@@ -27,7 +27,7 @@ jobs:
         run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --release --package commitor --target ${{ matrix.target }}
+        run: cargo build --release --package commitor-cli --target ${{ matrix.target }}
 
       # Asset names must stay `commitor-{target-triple}` (+ `.exe` on
       # Windows) — engine::update::find_matching_asset matches on them.

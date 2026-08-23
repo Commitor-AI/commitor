@@ -3,6 +3,8 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 
+mod engine;
+
 use engine::update;
 
 const USAGE: &str = "commitor — catch unrelated changes before they get buried

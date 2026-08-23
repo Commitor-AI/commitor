@@ -1,9 +1,27 @@
 [package]
-name = "commitor"
+name = "commitor-cli"
 version = "0.1.0"
 edition = "2021"
-description = "Commitor CLI — catches unrelated changes before they get buried in a commit"
+description = "Catches unrelated changes bundled into commits and splits them cleanly; early release with installer and self-update only"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Commitor-AI/commitor"
+readme = "../../README.md"
+keywords = ["git", "commit", "cli", "conventional-commits"]
+categories = ["development-tools", "command-line-utilities"]
+
+# The published crate is `commitor-cli` (the crates.io name `commitor`
+# is taken), but the installed binary stays `commitor` so the
+# user-facing command is unchanged.
+[[bin]]
+name = "commitor"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-engine = { path = "../engine" }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+serde_json = "1"
