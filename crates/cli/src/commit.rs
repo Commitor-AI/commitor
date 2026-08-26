@@ -39,9 +39,19 @@ pub struct CommitFlags {
     /// Skip the AI entirely: build a basic local plan without needing
     /// an account, a backend, or remaining quota.
     pub offline: bool,
+    /// Pick (or create) the branch to commit to before committing.
+    pub branch: bool,
 }
 
 pub fn run(flags: CommitFlags) -> Result<ExitCode> {
+    // ── 0. Branch selection (optional) ─────────────────────────────
+    // Switch to the chosen branch up front so the diff is collected
+    // and every resulting commit lands there. Uncommitted changes are
+    // carried over by git when they don't conflict with the target.
+    if flags.branch {
+        select_branch()?;
+    }
+
     // ── 1. Collect the diff ─────────────────────────────────────────
     // Same collection rules as scan: staged unless --all, with the
     // same unstaged-fallback warning — plus untracked files folded in
@@ -587,4 +597,94 @@ fn prompt_choice(question: &str) -> Result<Choice> {
             _ => println!("Please answer a, e, or c (Enter = accept)."),
         }
     }
+}
+
+/// Interactive branch picker for `commitor commit -b`.
+///
+/// Lists every local branch (marking the current one) plus a "create
+/// new branch" entry, then checks out the selection so the commits
+/// created by the rest of the run land on it. Loops on invalid input
+/// or git failures rather than aborting the whole commit.
+fn select_branch() -> Result<()> {
+    let (branches, current) = git::list_branches()?;
+
+    loop {
+        println!();
+        println!("Choose a branch to commit to:");
+        for (index, name) in branches.iter().enumerate() {
+            if current.as_deref() == Some(name.as_str()) {
+                println!("  {}: {} (current)", index + 1, name);
+            } else {
+                println!("  {}: {}", index + 1, name);
+            }
+        }
+        let new_index = branches.len() + 1;
+        println!("  {}: create a new branch", new_index);
+        println!();
+
+        let answer = prompt_line(&format!(
+            "Enter a number [1-{}] (or 'n' for a new branch): ",
+            new_index
+        ))?;
+        let answer = answer.trim();
+
+        if answer.eq_ignore_ascii_case("n") || answer == new_index.to_string() {
+            let name = prompt_line("New branch name: ")?;
+            let name = name.trim();
+            if name.is_empty() {
+                println!("Branch name can't be empty.");
+                continue;
+            }
+            if !is_valid_branch_name(name) {
+                println!("'{name}' is not a valid branch name.");
+                continue;
+            }
+            match git::create_branch(name) {
+                Ok(()) => {
+                    println!("Switched to new branch '{name}'.");
+                    return Ok(());
+                }
+                Err(err) => {
+                    println!("Couldn't create branch: {err:#}");
+                    continue;
+                }
+            }
+        } else if let Ok(num) = answer.parse::<usize>() {
+            if num >= 1 && num <= branches.len() {
+                let name = &branches[num - 1];
+                if current.as_deref() == Some(name.as_str()) {
+                    println!("Already on '{name}'.");
+                    return Ok(());
+                }
+                match git::checkout_branch(name) {
+                    Ok(()) => {
+                        println!("Switched to branch '{name}'.");
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        println!("Couldn't switch: {err:#}");
+                        println!("Commit or stash the conflicting changes first.");
+                        continue;
+                    }
+                }
+            } else {
+                println!("Please enter a number between 1 and {new_index}.");
+            }
+        } else {
+            println!("Please enter a number or 'n'.");
+        }
+    }
+}
+
+/// Lightweight git branch-name check: rejects the paths and characters
+/// git itself forbids. Real validation still happens in git, so this
+/// is just a friendlier early error.
+fn is_valid_branch_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('/')
+        && !name.ends_with('/')
+        && !name.contains("..")
+        && !name
+            .chars()
+            .any(|c| matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
 }

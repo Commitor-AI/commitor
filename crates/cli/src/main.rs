@@ -58,6 +58,9 @@ enum Commands {
         /// (no account or backend needed)
         #[arg(long)]
         offline: bool,
+        /// Choose (or create) the branch to commit to before committing
+        #[arg(short = 'b')]
+        branch: bool,
     },
     /// Update commitor to the latest release
     Update,
@@ -127,8 +130,8 @@ fn execute(command: Commands) -> Result<ExitCode, Option<anyhow::Error>> {
             strict,
             json,
         }).map_err(Some),
-        Commands::Commit { all, offline } => {
-            commit::run(commit::CommitFlags { all, offline }).map_err(Some)
+        Commands::Commit { all, offline, branch } => {
+            commit::run(commit::CommitFlags { all, offline, branch }).map_err(Some)
         }
         Commands::Update => run_update().map(|_| ExitCode::SUCCESS).map_err(Some),
     }

@@ -173,6 +173,52 @@ pub fn reset_index() -> Result<()> {
     run_git(&["reset", "-q"]).map(drop)
 }
 
+/// All local branch names plus the current one (if any). `current` is
+/// `None` in a detached HEAD or a brand-new repository with no commits
+/// yet — callers should treat that as "no usable current branch".
+pub fn list_branches() -> Result<(Vec<String>, Option<String>)> {
+    // `git branch` errors on a repo with no commits, so tolerate that
+    // and just report an empty list: the user will create the first
+    // branch via the `-b` "new branch" option.
+    let branches = match run_git(&["branch", "--format=%(refname:short)"]) {
+        Ok(out) => out
+            .lines()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+
+    let current = match run_git(&["rev-parse", "--abbrev-ref", "HEAD"]) {
+        Ok(out) => {
+            let name = out.trim().to_string();
+            if name.is_empty() || name == "HEAD" {
+                None
+            } else {
+                Some(name)
+            }
+        }
+        Err(_) => None,
+    };
+
+    Ok((branches, current))
+}
+
+/// Switch to an existing local branch (`git checkout <branch>`).
+///
+/// Fails (via git) when the working tree has conflicting uncommitted
+/// changes — those must be committed or stashed first.
+pub fn checkout_branch(branch: &str) -> Result<()> {
+    run_git(&["checkout", branch]).map(drop)
+}
+
+/// Create a new branch from the current HEAD and switch to it
+/// (`git checkout -b <branch>`). Uncommitted changes are carried over
+/// to the new branch by git.
+pub fn create_branch(branch: &str) -> Result<()> {
+    run_git(&["checkout", "-b", branch]).map(drop)
+}
+
 fn run_git(args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .args(args)
