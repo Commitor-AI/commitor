@@ -34,11 +34,13 @@ pub fn run(flags: ScanFlags) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    println!(
-        "Scanning {} changed file(s) ({}).",
-        collected.files.len(),
-        if collected.staged_used { "staged" } else { "unstaged" }
-    );
+    if !flags.json {
+        println!(
+            "Scanning {} changed file(s) ({}).",
+            collected.files.len(),
+            if collected.staged_used { "staged" } else { "unstaged" }
+        );
+    }
 
     // ── 2. Local heuristics ─────────────────────────────────────────
     let verdict = heuristics::evaluate(&collected.files);
@@ -73,7 +75,7 @@ pub fn run(flags: ScanFlags) -> Result<ExitCode> {
     // Credentials and the size guard are handled inside the shared
     // analysis call; this surfaces the standard not-logged-in message
     // before any network attempt.
-    let response = analysis::analyze_patch(&collected.patch)?;
+    let (response, rate) = analysis::analyze_patch(&collected.patch)?;
 
     // ── 4./5. Verdict + report ──────────────────────────────────────
     if flags.json {
@@ -87,6 +89,15 @@ pub fn run(flags: ScanFlags) -> Result<ExitCode> {
         print_success(&summary);
     } else {
         print_mixed_report(&response, &reason);
+    }
+
+    // Soft quota hint on human output only — JSON and piped output
+    // must stay machine-clean.
+    if !flags.json {
+        if let Some(message) = rate.low_quota_message() {
+            eprintln!();
+            eprintln!("{message}");
+        }
     }
 
     if response.groups.len() > 1 && flags.strict {
