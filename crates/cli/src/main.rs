@@ -58,7 +58,11 @@ enum Commands {
         /// (no account or backend needed)
         #[arg(long)]
         offline: bool,
-        /// Choose (or create) the branch to commit to before committing
+        /// Interactively choose the branch to commit to: lists local
+        /// branches (marking the current one) plus a "new branch"
+        /// option, then switches to the choice before committing. The
+        /// new-branch prompt suggests a name from the diff (Tab to
+        /// accept, or type your own; Ctrl-C to skip)
         #[arg(short = 'b')]
         branch: bool,
     },

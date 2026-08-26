@@ -769,8 +769,9 @@ fn read_branch_name(suggestion: &str) -> io::Result<Option<String>> {
     use rustyline::hint::Hinter;
     use rustyline::highlight::Highlighter;
     use rustyline::validate::Validator;
-    use rustyline::{Context, Editor, Helper, Result as RlResult};
+    use rustyline::{CompletionType, Context, Editor, Helper, Result as RlResult};
     use rustyline::history::DefaultHistory;
+    use std::borrow::Cow;
 
     /// Offers the diff-derived suggestion(s) as Tab completions and as
     /// an inline (grey) hint, exactly like a shell would.
@@ -812,7 +813,23 @@ fn read_branch_name(suggestion: &str) -> io::Result<Option<String>> {
         }
     }
 
-    impl Highlighter for BranchCompleter {}
+    impl Highlighter for BranchCompleter {
+        // Render the suggestion as a dim/transparent inline hint so it
+        // reads as a ghost of what Tab will fill in, not normal text.
+        fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+            Cow::Owned(format!("\x1b[2m{hint}\x1b[0m"))
+        }
+
+        // Keep the listed completion (if ever shown) consistent with
+        // the dimmed hint style.
+        fn highlight_candidate<'c>(
+            &self,
+            candidate: &'c str,
+            _completion: CompletionType,
+        ) -> Cow<'c, str> {
+            Cow::Owned(format!("\x1b[2m{candidate}\x1b[0m"))
+        }
+    }
     impl Validator for BranchCompleter {}
     impl Helper for BranchCompleter {}
 
@@ -821,9 +838,7 @@ fn read_branch_name(suggestion: &str) -> io::Result<Option<String>> {
         .map_err(io::Error::other)?;
     editor.set_helper(Some(BranchCompleter { candidates }));
 
-    println!(
-        "Suggested: {suggestion}  (Tab to complete, or type your own; Ctrl-C to skip)"
-    );
+    println!("Tab to complete, or type your own; Ctrl-C to skip");
     match editor.readline("New branch name: ") {
         Ok(line) => {
             let name = line.trim().to_string();
