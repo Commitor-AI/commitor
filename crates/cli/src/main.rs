@@ -54,6 +54,10 @@ enum Commands {
         /// Plan commits from unstaged changes instead of staged ones
         #[arg(long)]
         all: bool,
+        /// Skip the AI entirely — plan from local heuristics only
+        /// (no account or backend needed)
+        #[arg(long)]
+        offline: bool,
     },
     /// Update commitor to the latest release
     Update,
@@ -123,8 +127,8 @@ fn execute(command: Commands) -> Result<ExitCode, Option<anyhow::Error>> {
             strict,
             json,
         }).map_err(Some),
-        Commands::Commit { all } => {
-            commit::run(commit::CommitFlags { all }).map_err(Some)
+        Commands::Commit { all, offline } => {
+            commit::run(commit::CommitFlags { all, offline }).map_err(Some)
         }
         Commands::Update => run_update().map(|_| ExitCode::SUCCESS).map_err(Some),
     }
