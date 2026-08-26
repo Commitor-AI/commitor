@@ -8,7 +8,7 @@
 //! 3. the authenticated backend call itself (size guard + long
 //!    timeout + friendly HTTP error mapping).
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, DASHBOARD_URL};
@@ -19,9 +19,20 @@ use crate::engine::git;
 // layer instead of importing `auth` directly.
 pub use crate::auth::load_api_key;
 
-/// The backend may route to a slow reasoning model; give it room
-/// instead of failing mid-analysis.
-const ANALYZE_TIMEOUT_SECS: u64 = 120;
+/// The backend may run an escalation chain (fast pass, reasoning
+/// escalation, recheck and message-quality turns) on a slow model;
+/// give the whole request room instead of failing mid-analysis.
+/// `COMMITOR_TIMEOUT_SECS` overrides this for slow setups.
+const ANALYZE_TIMEOUT_SECS: u64 = 180;
+
+fn analyze_timeout() -> std::time::Duration {
+    let secs = std::env::var("COMMITOR_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(ANALYZE_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs)
+}
 
 /// The backend rejects diffs over 200k characters (`AnalyzeRequest`
 /// `max_length`); stop just short of that so the request never 422s.
@@ -153,93 +164,225 @@ fn synthesize_untracked_section(path: &str) -> Result<String> {
 
 // ── backend escalation ──────────────────────────────────────────────
 
+/// Quota info the backend attaches to every analyze response via
+/// `X-RateLimit-*` headers. All fields optional so older backends
+/// (which send no headers) degrade silently.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RateStatus {
+    pub remaining: Option<u32>,
+}
+
+impl RateStatus {
+    /// The soft "running out of quota" hint, when one should be shown.
+    pub fn low_quota_message(&self) -> Option<String> {
+        let n = self.remaining?;
+        if n > 3 {
+            return None;
+        }
+        Some(if n == 1 {
+            "1 analysis left today".to_string()
+        } else {
+            format!("{n} analyses left today")
+        })
+    }
+}
+
 /// Run the full backend analysis for `patch`.
 ///
 /// Loads the stored API key (surfacing the standard not-logged-in
 /// message when absent), applies the size guard, then POSTs to
 /// `/analyze`. This is the entry point `scan` uses once its local
 /// heuristics are inconclusive.
-pub fn analyze_patch(patch: &str) -> Result<AnalyzeResponse> {
+///
+/// Returns the response plus the quota snapshot from the response
+/// headers, so commands can warn when the user is close to their
+/// daily limit.
+pub fn analyze_patch(patch: &str) -> Result<(AnalyzeResponse, RateStatus), AnalyzeError> {
     let api_key = auth::load_api_key()?;
     analyze_with_key(&api_key, patch)
 }
 
 /// Same as [`analyze_patch`] for callers that already loaded the key
 /// (e.g. `commit`, which requires auth before touching any state).
-pub fn analyze_with_key(api_key: &str, patch: &str) -> Result<AnalyzeResponse> {
+pub fn analyze_with_key(
+    api_key: &str,
+    patch: &str,
+) -> Result<(AnalyzeResponse, RateStatus), AnalyzeError> {
+    analyze_with_mode(api_key, patch, "scan")
+}
+
+/// Commit passes `mode = "commit"` so the backend never answers with
+/// the deterministic local tier — a commit deserves a real message.
+pub fn analyze_with_mode(
+    api_key: &str,
+    patch: &str,
+    mode: &str,
+) -> Result<(AnalyzeResponse, RateStatus), AnalyzeError> {
     if patch.chars().count() > MAX_PATCH_CHARS {
-        bail!(
+        return Err(AnalyzeError::Other(anyhow!(
             "The change is too large for analysis (>200k characters).\n\
              Try scanning a narrower set of changes, or split it manually."
-        );
+        )));
     }
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .context("failed to start async runtime")?;
-    runtime.block_on(analyze_request(api_key, patch))
+        .map_err(|err| AnalyzeError::Other(anyhow!("failed to start async runtime: {err:#}")))?;
+    runtime.block_on(analyze_request(api_key, patch, mode))
 }
 
 /// POST the diff to `{API_BASE_URL}/analyze`.
-async fn analyze_request(api_key: &str, patch: &str) -> Result<AnalyzeResponse> {
+async fn analyze_request(
+    api_key: &str,
+    patch: &str,
+    mode: &str,
+) -> Result<(AnalyzeResponse, RateStatus), AnalyzeError> {
     use reqwest::Client;
 
     let url = format!("{}/analyze", config::api_base_url());
 
     let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(ANALYZE_TIMEOUT_SECS))
+        .timeout(analyze_timeout())
         .build()
-        .context("failed to set up HTTP client")?;
+        .map_err(|err| AnalyzeError::Other(anyhow!("failed to set up HTTP client: {err:#}")))?;
 
     let request = auth::with_key(
         client.post(&url).json(&AnalyzeRequest {
             diff: patch,
             context: None,
+            mode: Some(mode),
         }),
         api_key,
     );
 
     let response = match request.send().await {
         Ok(response) => response,
-        Err(err) => bail!(
-            "Couldn't reach the Commitor API at {url} ({}). \
-             Is your backend running? Set COMMITOR_API_URL if it lives elsewhere.",
+        Err(err) => return Err(AnalyzeError::Unavailable(format!(
+            "couldn't reach the Commitor API at {url} ({}). Is your backend running? \
+             Set COMMITOR_API_URL if it lives elsewhere.",
             auth::root_cause(&err)
-        ),
+        ))),
     };
 
     let status = response.status();
     match status.as_u16() {
-        200 => response.json::<AnalyzeResponse>().await.with_context(|| {
-            format!("{url} returned a response that doesn't match the analyze schema")
-        }),
-        401 | 403 => bail!(
+        200 => {
+            let rate = parse_rate_status(response.headers());
+            let parsed = response.json::<AnalyzeResponse>().await.map_err(|err| {
+                AnalyzeError::Other(anyhow!(
+                    "{url} returned a response that doesn't match the analyze schema: {err}"
+                ))
+            })?;
+            Ok((parsed, rate))
+        }
+        401 | 403 => Err(AnalyzeError::InvalidKey(format!(
             "Your stored API key was rejected (HTTP {status}) — it may have expired or been revoked.\n\
              Run `commitor login --key <your-key>` again (get a key at {DASHBOARD_URL})"
-        ),
-        404 => bail!(
-            "{url} does not exist on this backend — is COMMITOR_API_URL pointing at a server with /analyze?"
-        ),
-        429 => bail!("Rate limited by the Commitor API — wait a moment and try again."),
+        ))),
+        429 => {
+            let body = response.text().await.unwrap_or_default();
+            Err(AnalyzeError::RateLimited(describe_rate_limit(&body)))
+        }
         _ => {
             let body = response.text().await.unwrap_or_default();
             let snippet: String = body.chars().take(200).collect();
             if snippet.is_empty() {
-                bail!("Commitor API returned HTTP {status} for {url}");
+                return Err(AnalyzeError::Unavailable(format!(
+                    "Commitor API returned HTTP {status} for {url}"
+                )));
             }
-            bail!("Commitor API returned HTTP {status} for {url}\nServer said: {snippet}");
+            Err(AnalyzeError::Unavailable(format!(
+                "Commitor API returned HTTP {status} for {url}\nServer said: {snippet}"
+            )))
         }
     }
 }
 
+/// Why an analysis could not be produced. Commit uses the first two
+/// variants as a signal to fall back to an offline plan instead of
+/// failing; everything else is a real error worth surfacing.
+#[derive(Debug)]
+pub enum AnalyzeError {
+    /// 429 — daily quota exhausted; message is human-friendly already.
+    RateLimited(String),
+    /// Backend unreachable, timed out, or answered 5xx.
+    Unavailable(String),
+    /// 401/403 — must be fixed by the user, never papered over.
+    InvalidKey(String),
+    /// Schema mismatches, oversized patches, config mistakes.
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for AnalyzeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AnalyzeError::RateLimited(msg)
+            | AnalyzeError::Unavailable(msg)
+            | AnalyzeError::InvalidKey(msg) => f.write_str(msg),
+            AnalyzeError::Other(err) => write!(f, "{err:#}"),
+        }
+    }
+}
+
+impl std::error::Error for AnalyzeError {}
+
+impl From<anyhow::Error> for AnalyzeError {
+    fn from(err: anyhow::Error) -> Self {
+        AnalyzeError::Other(err)
+    }
+}
+
+/// Turn a 429 body into a calm, actionable message. The backend sends
+/// `{error, message, limit, reset_at}`; anything else still gets a
+/// decent fallback instead of a raw HTTP error.
+fn describe_rate_limit(body: &str) -> String {
+    let pricing = "https://commitor.dev/pricing";
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(v) => {
+            let limit = v.get("limit").and_then(|l| l.as_u64());
+            let reset_at = v
+                .get("reset_at")
+                .and_then(|r| r.as_str())
+                .map(str::to_string);
+            match (limit, reset_at) {
+                (Some(limit), Some(reset_at)) => format!(
+                    "You've hit your daily limit ({limit}/{limit} analyses) — resets at {reset_at}. \
+                     Upgrade at {pricing} for more."
+                ),
+                _ => v
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .map(|m| format!("{m} See {pricing} for higher limits."))
+                    .unwrap_or_else(|| {
+                        format!("You've hit your usage limit. See {pricing} for higher limits.")
+                    }),
+            }
+        }
+        Err(_) => format!(
+            "You've hit your usage limit. Wait a bit and try again, or see {pricing} for higher limits."
+        ),
+    }
+}
+
+fn parse_rate_status(headers: &reqwest::header::HeaderMap) -> RateStatus {
+    let remaining = headers
+        .get("x-ratelimit-remaining")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u32>().ok());
+    RateStatus { remaining }
+}
+
 // ── wire format ─────────────────────────────────────────────────────
 
-/// Matches `AnalyzeRequest` in commitor-api.
+/// Matches `AnalyzeRequest` in commitor-api. `mode` is optional so
+/// older backends simply ignore it.
 #[derive(Serialize)]
 pub struct AnalyzeRequest<'a> {
     pub diff: &'a str,
     pub context: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<&'a str>,
 }
 
 /// Matches `AnalyzeResponse`. Tolerant by design so newer backends
