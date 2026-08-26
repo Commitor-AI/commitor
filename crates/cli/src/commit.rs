@@ -36,15 +36,13 @@ use crate::heuristics::{self, Verdict};
 #[derive(Debug, Default)]
 pub struct CommitFlags {
     pub all: bool,
+    /// Skip the AI entirely: build a basic local plan without needing
+    /// an account, a backend, or remaining quota.
+    pub offline: bool,
 }
 
 pub fn run(flags: CommitFlags) -> Result<ExitCode> {
-    // ── 1. Auth up front ────────────────────────────────────────────
-    // Same not-logged-in message and exit behavior as `scan`, checked
-    // before we look at any repository state.
-    let api_key = analysis::load_api_key()?;
-
-    // ── 2. Collect the diff ─────────────────────────────────────────
+    // ── 1. Collect the diff ─────────────────────────────────────────
     // Same collection rules as scan: staged unless --all, with the
     // same unstaged-fallback warning — plus untracked files folded in
     // as synthetic new-file sections (commit's expanded scope).
@@ -60,18 +58,40 @@ pub fn run(flags: CommitFlags) -> Result<ExitCode> {
         if collected.staged_used { "staged" } else { "unstaged" }
     );
 
-    // Local heuristics as a fast informational pre-check only.
+    // Snapshot of tracked-change state at plan time, for the
+    // stale-plan guard below.
+    let baseline = git::status_porcelain()?;
+
+    // Explicit --offline: no account, no backend, no quota needed.
+    if flags.offline {
+        println!("Offline mode — building a basic local plan (no AI).");
+        return commit_offline(&collected, &baseline);
+    }
+
+    // ── 2. Auth + local hint ────────────────────────────────────────
+    let api_key = analysis::load_api_key()?;
     let local_hint = match heuristics::evaluate(&collected.files) {
         Verdict::Inconclusive { reason } => Some(reason),
         Verdict::Clean { .. } => None,
     };
 
-    // Snapshot of tracked-change state at plan time, for the
-    // stale-plan guard below.
-    let baseline = git::status_porcelain()?;
-
     // ── 3. Backend analysis — always, even if heuristics look clean ─
-    let response = analysis::analyze_with_key(&api_key, &collected.patch)?;
+    // mode="commit": the backend never answers with its deterministic
+    // tier; commits get model-written messages.
+    let (response, rate) = match analysis::analyze_with_mode(&api_key, &collected.patch, "commit") {
+        Ok(ok) => ok,
+        // Quota gone or AI unreachable: degrade to an offline plan so a
+        // commit is never blocked by the service. Auth problems are NOT
+        // degraded — they need fixing.
+        Err(analysis::AnalyzeError::RateLimited(reason))
+        | Err(analysis::AnalyzeError::Unavailable(reason)) => {
+            println!();
+            println!("AI analysis unavailable — {reason}");
+            println!("Falling back to an offline plan; rerun later for an AI-crafted message.");
+            return commit_offline(&collected, &baseline);
+        }
+        Err(err) => return Err(err.into()),
+    };
 
     // The plan must describe the tree as it is right now; bail before
     // showing the user anything built on stale data.
@@ -89,8 +109,8 @@ pub fn run(flags: CommitFlags) -> Result<ExitCode> {
     }
 
     // ── 5. Act on the verdict ───────────────────────────────────────
-    if response.groups.len() <= 1 {
-        commit_single(&mut plan, &file_diffs, collected.staged_used, &baseline)
+    let code = if response.groups.len() <= 1 {
+        commit_single(&mut plan, &file_diffs, collected.staged_used, &baseline)?
     } else {
         commit_split(
             &response.groups,
@@ -99,7 +119,99 @@ pub fn run(flags: CommitFlags) -> Result<ExitCode> {
             &file_diffs,
             collected.staged_used,
             &baseline,
-        )
+        )?
+    };
+
+    // Soft quota hint, only after a fully successful run (stderr, so
+    // scripted consumers of stdout are unaffected).
+    if code == ExitCode::SUCCESS {
+        if let Some(message) = rate.low_quota_message() {
+            eprintln!();
+            eprintln!("{message}");
+        }
+    }
+
+    Ok(code)
+}
+
+/// Build a single-group plan locally: every changed file whole, one
+/// commit, message derived from the diff headers. Used for explicit
+/// `--offline` runs and as the automatic fallback when the AI is
+/// unavailable (quota exhausted, backend down). Splitting needs the
+/// model — offline always proposes exactly one commit.
+fn commit_offline(collected: &analysis::CollectedDiff, baseline: &str) -> Result<ExitCode> {
+    ensure_tree_unchanged(baseline)?;
+    let file_diffs = hunks::parse(&collected.patch);
+    let mut plan = vec![PlanGroup {
+        message: offline_commit_message(collected),
+        whole: collected.files.clone(),
+        partial: Vec::new(),
+    }];
+    if let Err(err) = hunks::validate(&file_diffs, &plan, &collected.files) {
+        bail!(
+            "The offline plan doesn't match the actual diff:\n  {err:#}\n\n\
+             Nothing was staged or committed."
+        );
+    }
+    commit_single(&mut plan, &file_diffs, collected.staged_used, baseline)
+}
+
+/// Deterministic message naming what each file does ("add auth.py;
+/// update api.py"), prefixed with the common top-level directory when
+/// there is one. Same spirit as the backend's local tier.
+fn offline_commit_message(collected: &analysis::CollectedDiff) -> String {
+    let mut actions: Vec<String> = Vec::new();
+    let mut old_path: Option<&str> = None;
+
+    let summarize = |path: &str| -> String {
+        path.trim_start_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(path)
+            .to_string()
+    };
+
+    for line in collected.patch.lines() {
+        if line.starts_with("diff --git ") {
+            old_path = None;
+        } else if let Some(rest) = line.strip_prefix("--- ") {
+            old_path = Some(rest.trim());
+        } else if let Some(rest) = line.strip_prefix("+++ b/") {
+            let name = summarize(rest);
+            let is_new = matches!(old_path, None | Some("/dev/null"));
+            let verb = if is_new { "add" } else { "update" };
+            push_unique(&mut actions, format!("{verb} {name}"));
+        } else if line.starts_with("+++ /dev/null") {
+            let name = old_path.map(summarize).unwrap_or_else(|| "file".into());
+            push_unique(&mut actions, format!("remove {name}"));
+        }
+    }
+
+    if actions.is_empty() {
+        return "chore: update working changes".to_string();
+    }
+
+    let listed: Vec<String> = actions.iter().take(5).cloned().collect();
+    let mut summary = listed.join("; ");
+    if actions.len() > 5 {
+        summary += &format!("; +{} more", actions.len() - 5);
+    }
+
+    let tops: Vec<&str> = collected
+        .files
+        .iter()
+        .filter_map(|p| p.split('/').next())
+        .collect();
+    if !tops.is_empty() && tops.iter().all(|t| *t == tops[0]) && tops[0] != "" {
+        format!("chore({}): {}", tops[0], summary)
+    } else {
+        format!("chore: {summary}")
+    }
+}
+
+fn push_unique(actions: &mut Vec<String>, action: String) {
+    if !actions.contains(&action) {
+        actions.push(action);
     }
 }
 
