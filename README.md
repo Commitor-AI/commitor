@@ -32,6 +32,7 @@ refused rather than committed.
 | `commitor whoami` | Show the account and plan behind the stored key |
 | `commitor scan` | Analyze the working diff for unrelated changes (read-only) |
 | `commitor commit` | Split the diff into AI-planned git commits you approve |
+| `commitor commit -b` | As above, but first pick (or create) the branch to commit to |
 | `commitor update` | Check GitHub for a newer release and install it |
 | `commitor version` | Print the installed version (`--version`, `-V` also work) |
 | `commitor help` | Show usage help |
@@ -50,6 +51,30 @@ refused rather than committed.
 | Flag | Effect |
 |---|---|
 | `--all` | Plan commits from unstaged changes instead of staged ones |
+| `-b` | Interactively choose the branch to commit to before committing |
+
+#### Choosing a branch with `-b`
+
+Pass `-b` to `commit` and commitor lists every local branch (marking the
+current one) plus a **“create a new branch”** option, then switches to your
+choice before anything is committed:
+
+```
+$ commitor commit -b
+Choose a branch to commit to:
+  1: master (current)
+  2: feature/login-flow
+  3: create a new branch
+
+Enter a number [1-3] (or 'n' for a new branch): n
+Tab to complete, or type your own; Ctrl-C to skip
+New branch name: update-auth-py-update-api-py
+Switched to new branch 'update-auth-py-update-api-py'.
+```
+
+When creating a branch, commitor suggests a name derived from the diff —
+press **Tab** to accept it, type your own name, or **Ctrl-C** to skip the
+picker and commit on the current branch.
 
 `scan` and `commit` need a backend account (`commitor login --key <key>` —
 get a key at [commitor.dev/dashboard](https://commitor.dev/dashboard)).
