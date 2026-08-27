@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 While the project is in 0.x, minor versions may add, change, or remove
 functionality freely; 1.0.0 marks a stable command surface.
 
+## [0.3.1] — 2026-08-27
+
+### Changed
+
+- Previous versions are no longer forced to update: `login`, `scan`,
+  `commit`, and the other server-facing commands now run on older builds.
+  A newer release is only surfaced as a non-fatal `note:` reminder
+  (suppressible with `COMMITOR_ALLOW_OUTDATED=1`). `commitor update`
+  still upgrades on demand.
+
 ## [0.3.0] — 2026-08-27
 
 ### Added

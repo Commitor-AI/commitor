@@ -76,22 +76,14 @@ fn main() -> ExitCode {
 
     let cli = Cli::parse();
 
-    // Server-facing commands only run when the CLI is current; pure
-    // info commands (`version`, help) and the self-updater stay
-    // available regardless.
+    // Remind (but never block) users running an older build before
+    // server-facing commands. Previous versions keep working against the
+    // API — updating is always optional. Pure info commands
+    // (`version`, help) and the self-updater stay unaffected.
     let result: Result<ExitCode, Option<anyhow::Error>> =
         if is_server_facing(&cli.command) {
-            match enforce_up_to_date() {
-                Ok(None) => execute(cli.command),
-                Ok(Some(latest)) => {
-                    eprintln!("error: commitor {latest} is available and must be installed first");
-                    eprintln!();
-                    eprintln!("Run `commitor update` to install it, then retry your command.");
-                    eprintln!("Set COMMITOR_ALLOW_OUTDATED=1 to bypass this check at your own risk.");
-                    Err(None)
-                }
-                Err(err) => Err(Some(err)),
-            }
+            notify_update_available();
+            execute(cli.command)
         } else {
             execute(cli.command)
         };
@@ -141,38 +133,39 @@ fn execute(command: Commands) -> Result<ExitCode, Option<anyhow::Error>> {
     }
 }
 
-/// Escape hatch for users the updater cannot serve (no matching asset,
-/// broken network on every attempt, ...).
+/// Escape hatch for users who would rather not be reminded about
+/// available updates (no matching asset, prefer to stay on a pinned
+/// version, ...). When set, no update notice is printed.
 fn allow_outdated() -> bool {
     std::env::var("COMMITOR_ALLOW_OUTDATED")
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false)
 }
 
-/// Make sure no newer release is pending before the caller proceeds.
+/// Print a non-fatal notice when a newer release exists, then return so
+/// the command proceeds regardless. Users are never required to update
+/// — older versions keep working against the API.
 ///
-/// Returns `Ok(Some(latest))` when an update must be installed first,
-/// `Ok(None)` when the CLI is up to date. The check itself:
+/// The check itself:
 ///
 /// 1. reads the local pending-update marker (instant), then
 /// 2. refreshes it against GitHub at most once a day.
 ///
-/// Network or API failures never lock the CLI out; they just defer
-/// enforcement to a later invocation. `COMMITOR_ALLOW_OUTDATED=1`
-/// skips the gate entirely.
-fn enforce_up_to_date() -> Result<Option<String>> {
+/// Network or API failures never interrupt the user; they just skip the
+/// notice. `COMMITOR_ALLOW_OUTDATED=1` suppresses the notice entirely.
+fn notify_update_available() {
     if allow_outdated() {
-        return Ok(None);
+        return;
     }
 
-    if let Some(latest) = update::pending_version().context(
-        "failed to read the pending-update state — set COMMITOR_ALLOW_OUTDATED=1 to bypass",
-    )? {
-        return Ok(Some(latest));
+    // Fast path: a previously recorded newer release.
+    if let Ok(Some(latest)) = update::pending_version() {
+        print_update_notice(&latest);
+        return;
     }
 
     if !matches!(update::update_check_due(), Ok(true)) {
-        return Ok(None);
+        return;
     }
 
     let checked = || -> Result<Option<String>> {
@@ -187,10 +180,18 @@ fn enforce_up_to_date() -> Result<Option<String>> {
     }();
 
     match checked {
-        Ok(found) => Ok(found),
-        // Fail open: a flaky network should not brick the CLI.
-        Err(_) => Ok(None),
+        // Fail open: a flaky network should not bother the user.
+        Ok(Some(latest)) => print_update_notice(&latest),
+        _ => {}
     }
+}
+
+fn print_update_notice(latest: &str) {
+    eprintln!(
+        "note: commitor {} is available — run `commitor update` to upgrade (current: v{}).",
+        latest,
+        update::current_version()
+    );
 }
 
 fn run_update() -> Result<()> {

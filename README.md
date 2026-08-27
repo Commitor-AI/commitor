@@ -82,10 +82,10 @@ get a key at [commitor.dev/dashboard](https://commitor.dev/dashboard)).
 the changeset one logical change; `commit` always does, because every commit
 message comes from the analysis.
 
-Once an update has been discovered, server-facing commands refuse to run
-until you install it with `commitor update` — this keeps everyone on a
-current build while the command surface is small. Set
-`COMMITOR_ALLOW_OUTDATED=1` to bypass that check if you must.
+When a newer release is available, server-facing commands print a
+non-fatal `note:` reminding you to run `commitor update` — but they still
+run on older builds, so you're never forced to upgrade. Set
+`COMMITOR_ALLOW_OUTDATED=1` to suppress that reminder.
 
 ## Install
 
