@@ -30,7 +30,8 @@ jobs:
         run: cargo build --release --package commitor-cli --target ${{ matrix.target }}
 
       # Asset names must stay `commitor-{target-triple}` (+ `.exe` on
-      # Windows) — engine::update::find_matching_asset matches on them.
+      # Windows) — engine::update::find_matching_asset matches on them, and
+      # the npm postinstall downloader relies on the same naming.
       - name: Stage asset
         shell: bash
         run: |
@@ -38,6 +39,21 @@ jobs:
           if [ "${{ runner.os }}" = "Windows" ]; then ext=".exe"; fi
           cp "target/${{ matrix.target }}/release/commitor${ext}" \
              "commitor-${{ matrix.target }}${ext}"
+
+      # Publish a per-asset SHA-256 checksum. The npm postinstall downloader
+      # verifies against `commitor-{target-triple}[.exe].sha256`. The upload
+      # glob `commitor-${{ matrix.target }}*` picks this file up automatically.
+      - name: Generate checksum
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            certutil -hashfile "commitor-${{ matrix.target }}.exe" SHA256 \
+              | grep -v -i "hash" | tr -d '\r' \
+              > "commitor-${{ matrix.target }}.sha256"
+          else
+            shasum -a 256 "commitor-${{ matrix.target }}" \
+              > "commitor-${{ matrix.target }}.sha256"
+          fi
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2

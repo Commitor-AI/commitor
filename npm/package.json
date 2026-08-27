@@ -1,0 +1,34 @@
+{
+  "name": "commitor-cli",
+  "version": "0.3.0",
+  "description": "Catches unrelated changes bundled into commits and splits them cleanly — whole-file or hunk-level, guided by AI analysis",
+  "bin": {
+    "commitor": "bin/commitor.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Commitor-AI/commitor.git"
+  },
+  "homepage": "https://github.com/Commitor-AI/commitor",
+  "bugs": {
+    "url": "https://github.com/Commitor-AI/commitor/issues"
+  },
+  "keywords": [
+    "git",
+    "commit",
+    "cli",
+    "conventional-commits"
+  ],
+  "license": "MIT OR Apache-2.0",
+  "engines": {
+    "node": ">=14"
+  },
+  "files": [
+    "bin",
+    "install.js",
+    "README.md"
+  ]
+}
