@@ -61,7 +61,25 @@ pub fn run(flags: CommitFlags) -> Result<ExitCode> {
     // the target. After switching, re-collect so the diff reflects the
     // (possibly new) branch HEAD before anything is staged/committed.
     if flags.branch {
-        let suggestion = suggest_branch_name(&collected);
+        // Prefer an AI-recommended name that reads the diff; fall back to
+        // the local heuristic when offline, unauthenticated, or if the
+        // backend can't suggest one. The suggestion only pre-fills the
+        // "create a new branch" prompt — the user can still edit it.
+        let suggestion = if flags.offline {
+            suggest_branch_name(&collected)
+        } else {
+            match analysis::load_api_key() {
+                Ok(key) => match analysis::analyze_with_mode(&key, &collected.patch, "branch") {
+                    Ok((resp, _)) => resp
+                        .branch_name
+                        .map(|name| slugify(&name))
+                        .filter(|name| !name.is_empty() && is_valid_branch_name(name))
+                        .unwrap_or_else(|| suggest_branch_name(&collected)),
+                    Err(_) => suggest_branch_name(&collected),
+                },
+                Err(_) => suggest_branch_name(&collected),
+            }
+        };
         select_branch(&suggestion)?;
         collected = analysis::collect_diff(flags.all, true)?;
         if collected.files.is_empty() {
@@ -120,9 +138,28 @@ pub fn run(flags: CommitFlags) -> Result<ExitCode> {
     let mut plan = build_plan(&response.groups);
 
     if let Err(err) = hunks::validate(&file_diffs, &plan, &collected.files) {
-        bail!(
-            "The suggested commit plan doesn't match the actual diff:\n  {err:#}\n\n\
-             Nothing was staged or committed. Please re-run `commitor commit`."
+        // The model's proposed split was internally inconsistent (e.g.
+        // a file claimed by two groups, or a partial claim that left a
+        // hunk unassigned). Rather than refuse and force the user into
+        // an endless re-run loop, degrade safely: commit everything in
+        // a single commit — reusing the same approved single-commit
+        // flow, so no change is ever lost or duplicated.
+        println!();
+        println!(
+            "note: the suggested split was inconsistent ({err}), so all changes\n\
+             will be committed in a single commit instead of being refused.\n\
+             Re-run later (or use `commitor commit --offline`) for an AI split."
+        );
+        let mut single = vec![PlanGroup {
+            message: offline_commit_message(&collected),
+            whole: collected.files.clone(),
+            partial: Vec::new(),
+        }];
+        return commit_single(
+            &mut single,
+            &file_diffs,
+            collected.staged_used,
+            &baseline,
         );
     }
 

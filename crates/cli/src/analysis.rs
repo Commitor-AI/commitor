@@ -398,6 +398,10 @@ pub struct AnalyzeResponse {
     pub confidence: Option<f32>,
     #[serde(default)]
     pub model_tier: Option<String>,
+    /// AI-suggested kebab-case branch name (populated by backend
+    /// mode="branch"); used to pre-fill `commitor commit -b`.
+    #[serde(default)]
+    pub branch_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

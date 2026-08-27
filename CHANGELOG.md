@@ -3,9 +3,18 @@
 All notable changes to Commitor will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-While the project is in 0.x, minor versions may add, change, or remove
+and this project is in 0.x, minor versions may add, change, or remove
 functionality freely; 1.0.0 marks a stable command surface.
+
+## [Unreleased]
+
+### Changed
+
+- `commitor commit -b` now asks the AI to read the diff and recommend a
+  branch name for "create a new branch", pre-filling the prompt with the
+  suggestion. Falls back to the local diff-derived heuristic when offline,
+  unauthenticated, or if the backend can't suggest one (backend gains a
+  `mode="branch"` that returns `branch_name`).
 
 ## [0.3.1] — 2026-08-27
 
