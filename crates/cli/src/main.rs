@@ -54,6 +54,17 @@ enum Commands {
         /// Plan commits from unstaged changes instead of staged ones
         #[arg(long)]
         all: bool,
+        /// Skip the AI entirely — plan from local heuristics only
+        /// (no account or backend needed)
+        #[arg(long)]
+        offline: bool,
+        /// Interactively choose the branch to commit to: lists local
+        /// branches (marking the current one) plus a "new branch"
+        /// option, then switches to the choice before committing. The
+        /// new-branch prompt suggests a name from the diff (Tab to
+        /// accept, or type your own; Ctrl-C to skip)
+        #[arg(short = 'b')]
+        branch: bool,
     },
     /// Update commitor to the latest release
     Update,
@@ -123,8 +134,8 @@ fn execute(command: Commands) -> Result<ExitCode, Option<anyhow::Error>> {
             strict,
             json,
         }).map_err(Some),
-        Commands::Commit { all } => {
-            commit::run(commit::CommitFlags { all }).map_err(Some)
+        Commands::Commit { all, offline, branch } => {
+            commit::run(commit::CommitFlags { all, offline, branch }).map_err(Some)
         }
         Commands::Update => run_update().map(|_| ExitCode::SUCCESS).map_err(Some),
     }

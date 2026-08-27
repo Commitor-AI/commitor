@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 While the project is in 0.x, minor versions may add, change, or remove
 functionality freely; 1.0.0 marks a stable command surface.
 
+## [0.3.0] — 2026-08-27
+
+### Added
+
+- `commitor commit` improvements:
+  - interactive branch selection with diff-derived suggestions,
+  - `suggest_branch_name` / `slugify` helpers for tidy default branch names,
+  - offline commit mode (`--offline`) and offline planning when AI analysis is
+    unavailable.
+- `commitor scan --json` now prints results only when the flag is set.
+- npm wrapper package (`commitor-cli`): install prebuilt binaries via
+  `npm install -g commitor-cli` — no Rust toolchain required. npm version tracks
+  the crate version 1:1.
+
+### Changed
+
+- Increased the `/analyze` timeout to 180s and added rate-limiting status
+  tracking with clearer error handling.
+
 ## [0.2.0] — 2026-08-23
 
 The core commands land: Commitor can now analyze your working diff and,

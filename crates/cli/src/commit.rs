@@ -36,22 +36,38 @@ use crate::heuristics::{self, Verdict};
 #[derive(Debug, Default)]
 pub struct CommitFlags {
     pub all: bool,
+    /// Skip the AI entirely: build a basic local plan without needing
+    /// an account, a backend, or remaining quota.
+    pub offline: bool,
+    /// Pick (or create) the branch to commit to before committing.
+    pub branch: bool,
 }
 
 pub fn run(flags: CommitFlags) -> Result<ExitCode> {
-    // ── 1. Auth up front ────────────────────────────────────────────
-    // Same not-logged-in message and exit behavior as `scan`, checked
-    // before we look at any repository state.
-    let api_key = analysis::load_api_key()?;
-
-    // ── 2. Collect the diff ─────────────────────────────────────────
+    // ── 1. Collect the diff ─────────────────────────────────────────
     // Same collection rules as scan: staged unless --all, with the
     // same unstaged-fallback warning — plus untracked files folded in
     // as synthetic new-file sections (commit's expanded scope).
-    let collected = analysis::collect_diff(flags.all, true)?;
+    let mut collected = analysis::collect_diff(flags.all, true)?;
     if collected.files.is_empty() {
         println!("Nothing to commit — no staged, unstaged, or untracked changes.");
         return Ok(ExitCode::SUCCESS);
+    }
+
+    // ── 0. Branch selection (optional) ─────────────────────────────
+    // Switch to the chosen branch up front so every resulting commit
+    // lands there. A name is suggested from the diff; uncommitted
+    // changes are carried over by git when they don't conflict with
+    // the target. After switching, re-collect so the diff reflects the
+    // (possibly new) branch HEAD before anything is staged/committed.
+    if flags.branch {
+        let suggestion = suggest_branch_name(&collected);
+        select_branch(&suggestion)?;
+        collected = analysis::collect_diff(flags.all, true)?;
+        if collected.files.is_empty() {
+            println!("Nothing to commit after switching branches.");
+            return Ok(ExitCode::SUCCESS);
+        }
     }
 
     println!(
@@ -60,18 +76,40 @@ pub fn run(flags: CommitFlags) -> Result<ExitCode> {
         if collected.staged_used { "staged" } else { "unstaged" }
     );
 
-    // Local heuristics as a fast informational pre-check only.
+    // Snapshot of tracked-change state at plan time, for the
+    // stale-plan guard below.
+    let baseline = git::status_porcelain()?;
+
+    // Explicit --offline: no account, no backend, no quota needed.
+    if flags.offline {
+        println!("Offline mode — building a basic local plan (no AI).");
+        return commit_offline(&collected, &baseline);
+    }
+
+    // ── 2. Auth + local hint ────────────────────────────────────────
+    let api_key = analysis::load_api_key()?;
     let local_hint = match heuristics::evaluate(&collected.files) {
         Verdict::Inconclusive { reason } => Some(reason),
         Verdict::Clean { .. } => None,
     };
 
-    // Snapshot of tracked-change state at plan time, for the
-    // stale-plan guard below.
-    let baseline = git::status_porcelain()?;
-
     // ── 3. Backend analysis — always, even if heuristics look clean ─
-    let response = analysis::analyze_with_key(&api_key, &collected.patch)?;
+    // mode="commit": the backend never answers with its deterministic
+    // tier; commits get model-written messages.
+    let (response, rate) = match analysis::analyze_with_mode(&api_key, &collected.patch, "commit") {
+        Ok(ok) => ok,
+        // Quota gone or AI unreachable: degrade to an offline plan so a
+        // commit is never blocked by the service. Auth problems are NOT
+        // degraded — they need fixing.
+        Err(analysis::AnalyzeError::RateLimited(reason))
+        | Err(analysis::AnalyzeError::Unavailable(reason)) => {
+            println!();
+            println!("AI analysis unavailable — {reason}");
+            println!("Falling back to an offline plan; rerun later for an AI-crafted message.");
+            return commit_offline(&collected, &baseline);
+        }
+        Err(err) => return Err(err.into()),
+    };
 
     // The plan must describe the tree as it is right now; bail before
     // showing the user anything built on stale data.
@@ -89,8 +127,8 @@ pub fn run(flags: CommitFlags) -> Result<ExitCode> {
     }
 
     // ── 5. Act on the verdict ───────────────────────────────────────
-    if response.groups.len() <= 1 {
-        commit_single(&mut plan, &file_diffs, collected.staged_used, &baseline)
+    let code = if response.groups.len() <= 1 {
+        commit_single(&mut plan, &file_diffs, collected.staged_used, &baseline)?
     } else {
         commit_split(
             &response.groups,
@@ -99,7 +137,140 @@ pub fn run(flags: CommitFlags) -> Result<ExitCode> {
             &file_diffs,
             collected.staged_used,
             &baseline,
-        )
+        )?
+    };
+
+    // Soft quota hint, only after a fully successful run (stderr, so
+    // scripted consumers of stdout are unaffected).
+    if code == ExitCode::SUCCESS {
+        if let Some(message) = rate.low_quota_message() {
+            eprintln!();
+            eprintln!("{message}");
+        }
+    }
+
+    Ok(code)
+}
+
+/// Build a single-group plan locally: every changed file whole, one
+/// commit, message derived from the diff headers. Used for explicit
+/// `--offline` runs and as the automatic fallback when the AI is
+/// unavailable (quota exhausted, backend down). Splitting needs the
+/// model — offline always proposes exactly one commit.
+fn commit_offline(collected: &analysis::CollectedDiff, baseline: &str) -> Result<ExitCode> {
+    ensure_tree_unchanged(baseline)?;
+    let file_diffs = hunks::parse(&collected.patch);
+    let mut plan = vec![PlanGroup {
+        message: offline_commit_message(collected),
+        whole: collected.files.clone(),
+        partial: Vec::new(),
+    }];
+    if let Err(err) = hunks::validate(&file_diffs, &plan, &collected.files) {
+        bail!(
+            "The offline plan doesn't match the actual diff:\n  {err:#}\n\n\
+             Nothing was staged or committed."
+        );
+    }
+    commit_single(&mut plan, &file_diffs, collected.staged_used, baseline)
+}
+
+/// Derive a short, human-readable list of "verb file" actions from the
+/// patch (add/update/remove per file). Shared by the offline commit
+/// message and the `commit -b` branch-name suggestion.
+fn diff_actions(collected: &analysis::CollectedDiff) -> Vec<String> {
+    let mut actions: Vec<String> = Vec::new();
+    let mut old_path: Option<&str> = None;
+
+    let summarize = |path: &str| -> String {
+        path.trim_start_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(path)
+            .to_string()
+    };
+
+    for line in collected.patch.lines() {
+        if line.starts_with("diff --git ") {
+            old_path = None;
+        } else if let Some(rest) = line.strip_prefix("--- ") {
+            old_path = Some(rest.trim());
+        } else if let Some(rest) = line.strip_prefix("+++ b/") {
+            let name = summarize(rest);
+            let is_new = matches!(old_path, None | Some("/dev/null"));
+            let verb = if is_new { "add" } else { "update" };
+            push_unique(&mut actions, format!("{verb} {name}"));
+        } else if line.starts_with("+++ /dev/null") {
+            let name = old_path.map(summarize).unwrap_or_else(|| "file".into());
+            push_unique(&mut actions, format!("remove {name}"));
+        }
+    }
+
+    actions
+}
+
+/// Deterministic message naming what each file does ("add auth.py;
+/// update api.py"), prefixed with the common top-level directory when
+/// there is one. Same spirit as the backend's local tier.
+fn offline_commit_message(collected: &analysis::CollectedDiff) -> String {
+    let actions = diff_actions(collected);
+    if actions.is_empty() {
+        return "chore: update working changes".to_string();
+    }
+
+    let listed: Vec<String> = actions.iter().take(5).cloned().collect();
+    let mut summary = listed.join("; ");
+    if actions.len() > 5 {
+        summary += &format!("; +{} more", actions.len() - 5);
+    }
+
+    let tops: Vec<&str> = collected
+        .files
+        .iter()
+        .filter_map(|p| p.split('/').next())
+        .collect();
+    if !tops.is_empty() && tops.iter().all(|t| *t == tops[0]) && !tops[0].is_empty() {
+        format!("chore({}): {}", tops[0], summary)
+    } else {
+        format!("chore: {summary}")
+    }
+}
+
+/// Suggest a branch name from the diff, the same way the offline commit
+/// message is derived, but lowercased and hyphenated into a valid,
+/// branch-safe slug (e.g. "add auth.py; update api.py" →
+/// "add-auth-py-update-api-py").
+fn suggest_branch_name(collected: &analysis::CollectedDiff) -> String {
+    let actions = diff_actions(collected);
+    if actions.is_empty() {
+        return "changes".to_string();
+    }
+
+    let slug = slugify(&actions.join(" "));
+    if slug.is_empty() {
+        "changes".to_string()
+    } else {
+        slug
+    }
+}
+
+/// Turn arbitrary text into a lowercase, hyphen-separated slug using
+/// only `[a-z0-9-]`, collapsing runs and trimming edge hyphens.
+fn slugify(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let trimmed: String = out.trim_matches('-').to_string();
+    trimmed.chars().take(50).collect()
+}
+
+fn push_unique(actions: &mut Vec<String>, action: String) {
+    if !actions.contains(&action) {
+        actions.push(action);
     }
 }
 
@@ -476,3 +647,218 @@ fn prompt_choice(question: &str) -> Result<Choice> {
         }
     }
 }
+
+/// Interactive branch picker for `commitor commit -b`.
+///
+/// Lists every local branch (marking the current one) plus a "create
+/// new branch" entry, then checks out the selection so the commits
+/// created by the rest of the run land on it. Loops on invalid input
+/// or git failures rather than aborting the whole commit. `suggestion`
+/// is a diff-derived name offered (via Tab or Enter) when creating a
+/// new branch.
+fn select_branch(suggestion: &str) -> Result<()> {
+    let (branches, current) = git::list_branches()?;
+
+    loop {
+        println!();
+        println!("Choose a branch to commit to:");
+        for (index, name) in branches.iter().enumerate() {
+            if current.as_deref() == Some(name.as_str()) {
+                println!("  {}: {} (current)", index + 1, name);
+            } else {
+                println!("  {}: {}", index + 1, name);
+            }
+        }
+        let new_index = branches.len() + 1;
+        println!("  {}: create a new branch", new_index);
+        println!();
+
+        let answer = prompt_line(&format!(
+            "Enter a number [1-{}] (or 'n' for a new branch): ",
+            new_index
+        ))?;
+        let answer = answer.trim();
+
+        // Empty input (e.g. piped EOF) — skip selection rather than
+        // looping forever on a closed stdin.
+        if answer.is_empty() {
+            println!("No selection — committing on the current branch.");
+            return Ok(());
+        }
+
+        if answer.eq_ignore_ascii_case("n") || answer == new_index.to_string() {
+            match read_branch_name(suggestion)? {
+                Some(name) if !name.trim().is_empty() => {
+                    let name = name.trim();
+                    if !is_valid_branch_name(name) {
+                        println!("'{name}' is not a valid branch name.");
+                        continue;
+                    }
+                    match git::create_branch(name) {
+                        Ok(()) => {
+                            println!("Switched to new branch '{name}'.");
+                            return Ok(());
+                        }
+                        Err(err) => {
+                            println!("Couldn't create branch: {err:#}");
+                            continue;
+                        }
+                    }
+                }
+                Some(_) => {
+                    println!("Branch name can't be empty.");
+                    continue;
+                }
+                // Ctrl-C / abort: keep the current branch and proceed.
+                None => {
+                    println!("Branch selection skipped — committing on the current branch.");
+                    return Ok(());
+                }
+            }
+        } else if let Ok(num) = answer.parse::<usize>() {
+            if num >= 1 && num <= branches.len() {
+                let name = &branches[num - 1];
+                if current.as_deref() == Some(name.as_str()) {
+                    println!("Already on '{name}'.");
+                    return Ok(());
+                }
+                match git::checkout_branch(name) {
+                    Ok(()) => {
+                        println!("Switched to branch '{name}'.");
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        println!("Couldn't switch: {err:#}");
+                        println!("Commit or stash the conflicting changes first.");
+                        continue;
+                    }
+                }
+            } else {
+                println!("Please enter a number between 1 and {new_index}.");
+            }
+        } else {
+            println!("Please enter a number or 'n'.");
+        }
+    }
+}
+
+/// Lightweight git branch-name check: rejects the paths and characters
+/// git itself forbids. Real validation still happens in git, so this
+/// is just a friendlier early error.
+fn is_valid_branch_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('/')
+        && !name.ends_with('/')
+        && !name.contains("..")
+        && !name
+            .chars()
+            .any(|c| matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+}
+
+/// Read a branch name from the user, with a diff-derived `suggestion`.
+///
+/// Uses a real line editor (rustyline) so **Tab** behaves like a
+/// shell: it completes the input against the suggested name and also
+/// shows it as a grey inline hint, while the user can freely type
+/// their own name instead. Ctrl-C / Ctrl-D aborts the picker.
+///
+/// Returns `Ok(None)` when the user aborts; callers should treat that
+/// as "skip branch selection".
+fn read_branch_name(suggestion: &str) -> io::Result<Option<String>> {
+    use rustyline::completion::{Completer, Pair};
+    use rustyline::hint::Hinter;
+    use rustyline::highlight::Highlighter;
+    use rustyline::validate::Validator;
+    use rustyline::{CompletionType, Context, Editor, Helper, Result as RlResult};
+    use rustyline::history::DefaultHistory;
+    use std::borrow::Cow;
+
+    /// Offers the diff-derived suggestion(s) as Tab completions and as
+    /// an inline (grey) hint, exactly like a shell would.
+    struct BranchCompleter {
+        candidates: Vec<String>,
+    }
+
+    impl Completer for BranchCompleter {
+        type Candidate = Pair;
+
+        fn complete(
+            &self,
+            line: &str,
+            _pos: usize,
+            _ctx: &Context<'_>,
+        ) -> RlResult<(usize, Vec<Pair>)> {
+            let matches: Vec<Pair> = self
+                .candidates
+                .iter()
+                .filter(|c| c.starts_with(line))
+                .map(|c| Pair {
+                    display: c.clone(),
+                    replacement: c.clone(),
+                })
+                .collect();
+            // Complete against the whole current input.
+            Ok((0, matches))
+        }
+    }
+
+    impl Hinter for BranchCompleter {
+        type Hint = String;
+
+        fn hint(&self, line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<String> {
+            self.candidates
+                .iter()
+                .find(|c| c.starts_with(line) && c.as_str() != line)
+                .map(|c| c[line.len()..].to_string())
+        }
+    }
+
+    impl Highlighter for BranchCompleter {
+        // Render the suggestion as a dim/transparent inline hint so it
+        // reads as a ghost of what Tab will fill in, not normal text.
+        fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+            Cow::Owned(format!("\x1b[2m{hint}\x1b[0m"))
+        }
+
+        // Keep the listed completion (if ever shown) consistent with
+        // the dimmed hint style.
+        fn highlight_candidate<'c>(
+            &self,
+            candidate: &'c str,
+            _completion: CompletionType,
+        ) -> Cow<'c, str> {
+            Cow::Owned(format!("\x1b[2m{candidate}\x1b[0m"))
+        }
+    }
+    impl Validator for BranchCompleter {}
+    impl Helper for BranchCompleter {}
+
+    let candidates = branch_candidates(suggestion);
+    let mut editor =         Editor::<BranchCompleter, DefaultHistory>::new()
+        .map_err(io::Error::other)?;
+    editor.set_helper(Some(BranchCompleter { candidates }));
+
+    println!("Tab to complete, or type your own; Ctrl-C to skip");
+    match editor.readline("New branch name: ") {
+        Ok(line) => {
+            let name = line.trim().to_string();
+            if name.is_empty() {
+                Ok(Some(suggestion.to_string()))
+            } else {
+                Ok(Some(name))
+            }
+        }
+        Err(rustyline::error::ReadlineError::Interrupted) => Ok(None),
+        Err(rustyline::error::ReadlineError::Eof) => Ok(None),
+        Err(e) => Err(io::Error::other(e)),
+    }
+}
+
+/// Suggested branch-name completions offered on Tab. This is currently
+/// the single diff-derived suggestion (mirroring the offline commit
+/// message), but returning several candidates here would let Tab
+/// cycle/list them shell-style.
+fn branch_candidates(suggestion: &str) -> Vec<String> {
+    vec![suggestion.to_string()]
+}
+
