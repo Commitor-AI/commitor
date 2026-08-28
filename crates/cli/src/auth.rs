@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::config;
 
 /// Where users manage their keys — shown in error messages.
-pub const DASHBOARD_URL: &str = "https://commitor.dev/dashboard";
+pub const DASHBOARD_URL: &str = "https://commitor-web.vercel.app/dashboard";
 
 /// Seconds before an API call gives up.
 const API_TIMEOUT_SECS: u64 = 15;

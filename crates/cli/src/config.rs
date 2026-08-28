@@ -3,7 +3,7 @@
 /// Backend the CLI talks to. Local development default; flip to the
 /// hosted URL (e.g. `https://api.commitor.dev`) before shipping a
 /// release that expects production.
-pub const DEFAULT_API_URL: &str = "http://localhost:8000";
+pub const DEFAULT_API_URL: &str = "https://commitor-api.vercel.app";
 
 /// Backend base URL, e.g. `http://localhost:8000` (no trailing slash).
 ///

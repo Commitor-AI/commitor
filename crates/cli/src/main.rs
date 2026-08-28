@@ -26,7 +26,7 @@ struct Cli {
 enum Commands {
     /// Validate an API key against the backend and store it locally
     Login {
-        /// API key from https://commitor.dev/dashboard
+        /// API key from https://commitor-web.vercel.app/dashboard
         #[arg(long)]
         key: String,
     },
