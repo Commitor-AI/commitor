@@ -24,11 +24,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Validate an API key against the backend and store it locally
+    /// Sign in to Commitor: opens your browser to the web app, or pass
+    /// --key with an API key copied from the dashboard
     Login {
-        /// API key from https://commitor-web.vercel.app/dashboard
+        /// API key from the dashboard (skips the browser flow)
         #[arg(long)]
-        key: String,
+        key: Option<String>,
     },
     /// Delete the locally stored credentials
     Logout,
@@ -112,7 +113,12 @@ fn is_server_facing(command: &Commands) -> bool {
 
 fn execute(command: Commands) -> Result<ExitCode, Option<anyhow::Error>> {
     match command {
-        Commands::Login { key } => auth::login(&key).map(|_| ExitCode::SUCCESS).map_err(Some),
+        Commands::Login { key } => match key {
+            Some(k) => auth::login(&k),
+            None => auth::login_interactive(),
+        }
+        .map(|_| ExitCode::SUCCESS)
+        .map_err(Some),
         Commands::Logout => auth::logout().map(|_| ExitCode::SUCCESS).map_err(Some),
         Commands::Whoami => auth::whoami().map(|_| ExitCode::SUCCESS).map_err(Some),
         Commands::Scan {

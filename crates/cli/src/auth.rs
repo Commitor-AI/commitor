@@ -9,7 +9,11 @@
 //! hosted API ships).
 
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::thread;
 
 use anyhow::{bail, Context, Result};
 use reqwest::blocking::{Client, RequestBuilder, Response};
@@ -19,6 +23,12 @@ use crate::config;
 
 /// Where users manage their keys — shown in error messages.
 pub const DASHBOARD_URL: &str = "https://commitor-web.vercel.app/dashboard";
+
+/// Production-live frontend used by the browser-based login flow.
+const FRONTEND_URL: &str = "https://commitor-web.vercel.app";
+
+/// Local port the CLI listens on for the browser redirect after login.
+const CALLBACK_PORT: u16 = 18745;
 
 /// Seconds before an API call gives up.
 const API_TIMEOUT_SECS: u64 = 15;
@@ -63,7 +73,8 @@ fn home_dir() -> Result<PathBuf> {
 /// are stored.
 fn not_logged_in_error() -> anyhow::Error {
     anyhow::anyhow!(
-        "Not logged in. Run `commitor login --key <your-key>` — get a key at {DASHBOARD_URL}"
+        "Not logged in. Run `commitor login` (opens your browser) or \
+         `commitor login --key <your-key>` — get a key at {DASHBOARD_URL}"
     )
 }
 
@@ -237,6 +248,143 @@ fn save_credentials(api_key: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Browser-based login for users who aren't already authenticated.
+///
+/// Opens the web app's login page and starts a tiny local HTTP server
+/// that captures the API key when the frontend redirects back to
+/// `http://127.0.0.1:<CALLBACK_PORT>/callback?key=...`. If the frontend
+/// doesn't support the redirect (or the browser flow is interrupted), the
+/// user can paste an API key from the dashboard instead.
+pub fn login_interactive() -> Result<()> {
+    let redirect = format!("http://127.0.0.1:{CALLBACK_PORT}/callback");
+    let login_url = format!("{FRONTEND_URL}/login?redirect={redirect}");
+    println!("Opening your browser to sign in: {login_url}");
+    let _ = webbrowser::open(&login_url);
+
+    let (tx, rx) = mpsc::channel::<LoginSource>();
+
+    let mut have_server = false;
+    if let Ok(listener) = TcpListener::bind(("127.0.0.1", CALLBACK_PORT)) {
+        have_server = true;
+        let server_tx = tx.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                if let Ok(mut stream) = stream {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let req = String::from_utf8_lossy(&buf);
+                    if let Some(key) = extract_key(&req) {
+                        let _ = write_response(
+                            &mut stream,
+                            "✅ You're connected to Commitor! You can close this tab and \
+                             return to your terminal.",
+                        );
+                        let _ = server_tx.send(LoginSource::Callback(key));
+                        break;
+                    } else {
+                        let _ = write_response(&mut stream, "Missing key parameter.");
+                    }
+                }
+            }
+        });
+    } else {
+        println!("(Couldn't start a local callback server; you'll need to paste your key.)");
+    }
+
+    if have_server {
+        println!("If your browser redirects back here automatically, you're all set.");
+    }
+    println!("Otherwise, paste your API key from {DASHBOARD_URL} and press Enter:");
+
+    let stdin_tx = tx.clone();
+    thread::spawn(move || {
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_ok() {
+            let key = line.trim().to_string();
+            if !key.is_empty() {
+                let _ = stdin_tx.send(LoginSource::Manual(key));
+            }
+        }
+    });
+
+    match rx.recv() {
+        Ok(source) => {
+            let key = match source {
+                LoginSource::Callback(k) | LoginSource::Manual(k) => k,
+            };
+            login(&key)
+        }
+        Err(_) => bail!("Login was cancelled."),
+    }
+}
+
+/// How the API key reached `login_interactive`: via the browser redirect
+/// or pasted by the user.
+enum LoginSource {
+    Callback(String),
+    Manual(String),
+}
+
+/// Pull the `key` query parameter out of a raw HTTP request line.
+fn extract_key(req: &str) -> Option<String> {
+    let line = req.lines().next()?;
+    let path = line.split_whitespace().nth(1)?;
+    let query = path.split_once('?')?.1;
+    for pair in query.split('&') {
+        if let Some(value) = pair.strip_prefix("key=") {
+            return Some(percent_decode(value));
+        }
+    }
+    None
+}
+
+/// Minimal percent-decoder for the key (handles `%XX` and `+`).
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                if let (Some(h), Some(l)) = (hi, lo) {
+                    out.push((h * 16 + l) as u8 as char);
+                    i += 3;
+                } else {
+                    out.push('%');
+                    i += 1;
+                }
+            }
+            b'+' => {
+                out.push(' ');
+                i += 1;
+            }
+            b => {
+                out.push(b as char);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Write a tiny self-contained HTML response to the browser redirect.
+fn write_response(stream: &mut impl Write, body: &str) -> std::io::Result<()> {
+    let html = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Commitor CLI</title>\
+         <style>body{{font-family:system-ui,sans-serif;display:flex;min-height:100vh;\
+         align-items:center;justify-content:center;margin:0;background:#0b0b0f;color:#e7e7ea}}\
+         </style></head><body><p style=\"font-size:1.25rem\">{body}</p></body></html>"
+    );
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\
+         \r\nConnection: close\r\n\r\n{html}",
+        html.len()
+    );
+    stream.write_all(response.as_bytes())
 }
 
 /// Remove the stored credentials file, if any.

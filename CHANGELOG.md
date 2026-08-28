@@ -18,6 +18,13 @@ functionality freely; 1.0.0 marks a stable command surface.
 - `COMMITOR_API_URL` still overrides the default for pointing at a local or
   staging backend.
 
+### Added
+
+- `commitor login` with no `--key` now opens your browser to the web app
+  and connects automatically via a local redirect
+  (`http://127.0.0.1:18745/callback?key=…`); pasting a key from the
+  dashboard still works as a fallback.
+
 ## [0.3.2] — 2026-08-27
 
 ### Changed
