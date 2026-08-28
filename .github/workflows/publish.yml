@@ -38,7 +38,7 @@ jobs:
       - name: Verify crate version matches tag
         run: |
           tag="${TAG#v}"
-          pkg=$(cargo pkgid -p commitor-cli | sed 's/.*#//')
+          pkg=$(cargo pkgid -p commitor-cli | sed -E 's/.*[@#]//')
           if [ "$tag" != "$pkg" ]; then
             echo "Version mismatch: tag $tag vs crate $pkg" >&2
             exit 1
@@ -72,6 +72,7 @@ jobs:
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
+          always-auth: true
           token: ${{ secrets.NPM_TOKEN }}
 
       - name: Verify npm version matches tag
