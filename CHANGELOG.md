@@ -8,6 +8,21 @@ functionality freely; 1.0.0 marks a stable command surface.
 
 ## [0.3.3] — 2026-08-28
 
+### Added
+
+- **One-click login from the terminal.** `commitor login` (with no
+  `--key`) opens your browser to sign in, then connects automatically —
+  you no longer create or copy an API key. The web app issues a CLI key
+  for you and redirects back to a local callback
+  (`http://127.0.0.1:18745/callback?key=…`). If that flow is
+  interrupted, pasting a key from the dashboard still works as a fallback.
+
+### Improved
+
+- The browser "connected" page after login is redesigned to match the
+  Commitor site: a branded, animated success state (no emoji) instead of
+  a plain message.
+
 ### Changed
 
 - CLI now defaults to the **production live** backend instead of a local
@@ -17,13 +32,6 @@ functionality freely; 1.0.0 marks a stable command surface.
   `commitor.dev`.
 - `COMMITOR_API_URL` still overrides the default for pointing at a local or
   staging backend.
-
-### Added
-
-- `commitor login` with no `--key` now opens your browser to the web app
-  and connects automatically via a local redirect
-  (`http://127.0.0.1:18745/callback?key=…`); pasting a key from the
-  dashboard still works as a fallback.
 
 ## [0.3.2] — 2026-08-27
 

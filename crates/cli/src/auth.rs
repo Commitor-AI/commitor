@@ -1,8 +1,9 @@
 //! Login/session management for the Commitor CLI.
 //!
-//! Users create API keys in the web dashboard; the CLI stores the key
-//! locally and attaches it as `Authorization: Bearer <key>` on every
-//! request to the Commitor backend.
+//! `commitor login` opens the web app and auto-issues an API key via the
+//! browser redirect — no manual key creation or copying required. The CLI
+//! stores the key locally and attaches it as `Authorization: Bearer <key>`
+//! on every request to the Commitor backend.
 //!
 //! The backend base URL defaults to a local development server and can
 //! be overridden with `COMMITOR_API_URL` (no recompile needed when the
@@ -276,15 +277,14 @@ pub fn login_interactive() -> Result<()> {
                     let _ = stream.read(&mut buf);
                     let req = String::from_utf8_lossy(&buf);
                     if let Some(key) = extract_key(&req) {
-                        let _ = write_response(
-                            &mut stream,
-                            "✅ You're connected to Commitor! You can close this tab and \
-                             return to your terminal.",
-                        );
+                        let _ = write_connected(&mut stream);
                         let _ = server_tx.send(LoginSource::Callback(key));
                         break;
                     } else {
-                        let _ = write_response(&mut stream, "Missing key parameter.");
+                        let _ = write_error(
+                            &mut stream,
+                            "No API key was returned. Run `commitor login` again.",
+                        );
                     }
                 }
             }
@@ -371,20 +371,149 @@ fn percent_decode(input: &str) -> String {
     out
 }
 
-/// Write a tiny self-contained HTML response to the browser redirect.
-fn write_response(stream: &mut impl Write, body: &str) -> std::io::Result<()> {
-    let html = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Commitor CLI</title>\
-         <style>body{{font-family:system-ui,sans-serif;display:flex;min-height:100vh;\
-         align-items:center;justify-content:center;margin:0;background:#0b0b0f;color:#e7e7ea}}\
-         </style></head><body><p style=\"font-size:1.25rem\">{body}</p></body></html>"
-    );
+/// Render the success/error "connected" page shown in the browser after
+/// the `commitor login` redirect. Self-contained (inline CSS + SVG) and
+/// styled to match the Commitor web app: dark canvas, lime brand accent,
+/// animated draw-in check with a breathing glow — no emoji.
+fn page_html(
+    title: &str,
+    subtitle: &str,
+    caption: &str,
+    accent: &str,
+    glow: &str,
+    svg: &str,
+) -> String {
+    const TEMPLATE: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Commitor</title>
+<style>
+  :root{
+    --canvas:#050506; --surface:#0c0d10; --edge:rgba(255,255,255,.08);
+    --ink:#f4f6f5; --dim:#9ba1a6; --dimmer:#62676d;
+    --brand:ACCENT; --brand-bright:ACCENT; --glow:GLOW;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0; background:
+      radial-gradient(1100px 560px at 50% -12%, GLOW, transparent 60%),
+      var(--canvas);
+    color:var(--ink);
+    font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    display:flex; align-items:center; justify-content:center; padding:24px;
+    -webkit-font-smoothing:antialiased;
+  }
+  .card{
+    width:100%; max-width:384px; text-align:center; padding:44px 34px 30px;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,.025), rgba(255,255,255,0)),
+      var(--surface);
+    border:1px solid var(--edge); border-radius:18px;
+    box-shadow:0 1px 0 rgba(255,255,255,.05) inset, 0 24px 70px rgba(0,0,0,.55);
+    animation:fade-up .5s cubic-bezier(.2,.7,.2,1) both;
+  }
+  .badge{position:relative; width:72px; height:72px; margin:0 auto 24px}
+  .badge::after{
+    content:""; position:absolute; inset:-16px; border-radius:999px;
+    background:radial-gradient(circle, var(--glow), transparent 70%);
+    animation:pulse 2.6s ease-in-out infinite;
+  }
+  .check{position:relative; width:72px; height:72px; display:block}
+  .ring{
+    fill:none; stroke:var(--brand); stroke-width:2.5;
+    stroke-dasharray:151; stroke-dashoffset:151;
+    animation:draw-ring .6s cubic-bezier(.6,.1,.3,1) forwards;
+  }
+  .tick{
+    fill:none; stroke:var(--brand-bright); stroke-width:3.5;
+    stroke-linecap:round; stroke-linejoin:round;
+    stroke-dasharray:42; stroke-dashoffset:42;
+    filter:drop-shadow(0 0 6px var(--glow));
+    animation:draw-tick .45s .5s cubic-bezier(.6,.1,.3,1) forwards;
+  }
+  h1{margin:0 0 9px; font-size:19px; font-weight:600; letter-spacing:-.01em}
+  p{margin:0; color:var(--dim); font-size:14px; line-height:1.55}
+  .caption{
+    margin-top:24px;
+    font-family:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+    font-size:11px; letter-spacing:.06em; text-transform:uppercase; color:var(--dimmer);
+  }
+  .caption .dot{
+    display:inline-block; width:6px; height:6px; border-radius:50%;
+    background:var(--brand); margin-right:8px; vertical-align:middle;
+    animation:blink 1.5s steps(1) infinite;
+  }
+  @keyframes fade-up{from{opacity:0; transform:translateY(10px) scale(.99)} to{opacity:1; transform:none}}
+  @keyframes draw-ring{to{stroke-dashoffset:0}}
+  @keyframes draw-tick{to{stroke-dashoffset:0}}
+  @keyframes pulse{0%,100%{opacity:.45; transform:scale(.96)} 50%{opacity:.85; transform:scale(1.06)}}
+  @keyframes blink{0%,100%{opacity:1} 50%{opacity:.25}}
+</style>
+</head>
+<body>
+  <main class="card">
+    <div class="badge">
+      <svg class="check" viewBox="0 0 52 52" aria-hidden="true">SVG</svg>
+    </div>
+    <h1>TITLE</h1>
+    <p>SUBTITLE</p>
+    <div class="caption"><span class="dot"></span>CAPTION</div>
+  </main>
+</body>
+</html>"#;
+    TEMPLATE
+        .replace("ACCENT", accent)
+        .replace("GLOW", glow)
+        .replace("SVG", svg)
+        .replace("CAPTION", caption)
+        .replace("SUBTITLE", subtitle)
+        .replace("TITLE", title)
+}
+
+/// Write a self-contained HTML document back to the browser redirect.
+fn write_http(stream: &mut impl Write, html: &str) -> std::io::Result<()> {
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\
          \r\nConnection: close\r\n\r\n{html}",
         html.len()
     );
     stream.write_all(response.as_bytes())
+}
+
+/// Page shown when the browser redirect delivered a valid API key:
+/// the user is connected and can return to the terminal.
+fn write_connected(stream: &mut impl Write) -> std::io::Result<()> {
+    const SVG: &str =
+        r#"<circle class="ring" cx="26" cy="26" r="24"/><path class="tick" d="M15 27 l7 7 l15 -16"/>"#;
+    let html = page_html(
+        "You're connected to Commitor",
+        "You can close this tab and return to your terminal.",
+        "session established",
+        "#b8f23d",
+        "rgba(198,255,0,.35)",
+        SVG,
+    );
+    write_http(stream, &html)
+}
+
+/// Page shown when the redirect did not carry a key (rare — e.g. the user
+/// navigated to the callback manually). Keeps the same look, in the
+/// critical (red) accent.
+fn write_error(stream: &mut impl Write, msg: &str) -> std::io::Result<()> {
+    const SVG: &str =
+        r#"<circle class="ring" cx="26" cy="26" r="24"/><path class="tick" d="M17 17 l18 18 M35 17 l-18 18"/>"#;
+    let html = page_html(
+        "Couldn't connect",
+        msg,
+        "connection failed",
+        "#f43f5e",
+        "rgba(244,63,94,.30)",
+        SVG,
+    );
+    write_http(stream, &html)
 }
 
 /// Remove the stored credentials file, if any.
@@ -410,4 +539,34 @@ pub fn whoami() -> Result<()> {
     let plan = me.plan.unwrap_or_else(|| "free".to_string());
     println!("{} — {} plan", me.email, plan);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connected_page_renders_without_placeholders() {
+        const SVG: &str =
+            r#"<circle class="ring" cx="26" cy="26" r="24"/><path class="tick" d="M15 27 l7 7 l15 -16"/>"#;
+        let html = page_html(
+            "You're connected to Commitor",
+            "You can close this tab and return to your terminal.",
+            "session established",
+            "#b8f23d",
+            "rgba(198,255,0,.35)",
+            SVG,
+        );
+        for token in ["ACCENT", "GLOW", "SVG", "TITLE", "SUBTITLE", "CAPTION"] {
+            assert!(
+                !html.contains(token),
+                "placeholder {token} leaked into rendered page"
+            );
+        }
+        assert!(html.contains("stroke-dashoffset"));
+        assert!(html.contains("<h1>You're connected to Commitor</h1>"));
+        assert!(html.contains("<p>You can close this tab and return to your terminal.</p>"));
+        assert!(html.contains("<div class=\"caption\"><span class=\"dot\"></span>session established</div>"));
+        std::fs::write("/tmp/commitor-connected.html", &html).ok();
+    }
 }
