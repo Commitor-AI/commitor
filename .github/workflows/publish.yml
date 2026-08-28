@@ -71,9 +71,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-          registry-url: "https://registry.npmjs.org"
-          always-auth: true
-          token: ${{ secrets.NPM_TOKEN }}
 
       - name: Verify npm version matches tag
         run: |
@@ -85,6 +82,9 @@ jobs:
           fi
         env:
           TAG: ${{ steps.tag.outputs.value }}
+
+      - name: Configure npm auth
+        run: echo "//registry.npmjs.org/:_authToken=${{ secrets.NPM_TOKEN }}" > npm/.npmrc
 
       - name: Publish commitor-cli
         run: npm publish --access public
