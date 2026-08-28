@@ -1,0 +1,90 @@
+name: Publish to crates.io and npm
+
+# Runs whenever a GitHub Release is published, publishing the CLI to both
+# crates.io (the `commitor-cli` crate) and npm (the `commitor-cli` wrapper).
+# Can also be triggered manually to (re)publish a specific tag.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v0.3.3). Leave empty for release events."
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  cargo:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "value=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.value }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify crate version matches tag
+        run: |
+          tag="${TAG#v}"
+          pkg=$(cargo pkgid -p commitor-cli | sed 's/.*#//')
+          if [ "$tag" != "$pkg" ]; then
+            echo "Version mismatch: tag $tag vs crate $pkg" >&2
+            exit 1
+          fi
+        env:
+          TAG: ${{ steps.tag.outputs.value }}
+
+      - name: Publish commitor-cli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p commitor-cli
+
+  npm:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "value=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.value }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+          token: ${{ secrets.NPM_TOKEN }}
+
+      - name: Verify npm version matches tag
+        run: |
+          tag="${TAG#v}"
+          pkg=$(node -p "require('./npm/package.json').version")
+          if [ "$tag" != "$pkg" ]; then
+            echo "Version mismatch: tag $tag vs package $pkg" >&2
+            exit 1
+          fi
+        env:
+          TAG: ${{ steps.tag.outputs.value }}
+
+      - name: Publish commitor-cli
+        run: npm publish --access public
+        working-directory: npm
