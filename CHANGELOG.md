@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project is in 0.x, minor versions may add, change, or remove
 functionality freely; 1.0.0 marks a stable command surface.
 
+## [0.3.3] — 2026-08-28
+
+### Changed
+
+- CLI now defaults to the **production live** backend instead of a local
+  dev server: `DEFAULT_API_URL` points at `https://commitor-api.vercel.app`.
+- Dashboard links in help/error output now point at the live frontend
+  (`https://commitor-web.vercel.app/dashboard`) instead of the placeholder
+  `commitor.dev`.
+- `COMMITOR_API_URL` still overrides the default for pointing at a local or
+  staging backend.
+
 ## [0.3.2] — 2026-08-27
 
 ### Changed
