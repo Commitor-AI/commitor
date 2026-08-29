@@ -80,7 +80,7 @@ pub fn run(flags: CommitFlags) -> Result<ExitCode> {
             suggest_branch_name(&collected)
         } else {
             match analysis::load_api_key() {
-                Ok(key) => match analysis::analyze_with_mode(&key, &collected.patch, "branch") {
+                Ok(key) => match analysis::analyze_with_mode(&key, &collected.patch, "branch", None) {
                     Ok((resp, _)) => resp
                         .branch_name
                         .map(|name| slugify(&name))
@@ -138,7 +138,7 @@ pub fn run(flags: CommitFlags) -> Result<ExitCode> {
         let mut attempts = 0;
         loop {
             attempts += 1;
-            match analysis::analyze_with_mode(&api_key, &collected.patch, "commit") {
+            match analysis::analyze_with_mode(&api_key, &collected.patch, "commit", None) {
                 Ok(ok) => break ok,
                 // Quota gone or AI unreachable: offer to retry, fall back
                 // to an offline plan, or cancel — never block the commit
@@ -205,7 +205,7 @@ pub fn run(flags: CommitFlags) -> Result<ExitCode> {
             ))? {
                 RetryDecision::Retry => {
                     println!("Re-requesting an analysis…");
-                    match analysis::analyze_with_mode(&api_key, &collected.patch, "commit") {
+                    match analysis::analyze_with_mode(&api_key, &collected.patch, "commit", None) {
                         Ok(ok) => {
                             response = ok.0;
                             rate = ok.1;

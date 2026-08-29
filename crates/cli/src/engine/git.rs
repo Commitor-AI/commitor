@@ -58,6 +58,24 @@ pub fn changed_files(staged: bool) -> Result<Vec<String>> {
         .collect())
 }
 
+/// Changed file paths for a git range, one per line
+/// (`git diff <range> --name-only`).
+pub fn changed_files_range(range: &str) -> Result<Vec<String>> {
+    let out = run_git(&["diff", range, "--name-only"])?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// The full patch text for a git range (`git diff <range>`), used by
+/// `scan --diff-range` to analyze a PR/branch window.
+pub fn diff_range(range: &str) -> Result<String> {
+    run_git(&["diff", range])
+}
+
 /// Stage exactly the given paths (`git add -- <paths>`).
 ///
 /// The `--` separator keeps paths starting with `-` from being read

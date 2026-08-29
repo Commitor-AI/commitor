@@ -1,0 +1,161 @@
+# Commitor GitHub Action — PR change-analysis bot.
+#
+# Usage (see README.md for the full workflow):
+#   - uses: Commitor-AI/commitor-action@v1   # once published as its own repo
+#   - uses: ./action                          # or in-repo (this directory)
+#
+# The action downloads a pinned commitor binary, logs in with the user's
+# API key, runs `commitor scan --diff-range` against the PR base, and
+# posts (or updates) a Markdown PR comment with the result.
+name: Commitor PR Analysis
+description: >-
+  Analyze a pull request's diff with Commitor and post the result as a
+  PR comment, updating the previous comment instead of spamming new ones.
+author: Commitor-AI
+inputs:
+  github-token:
+    description: >-
+      Token used to read/update PR comments via the GitHub REST API.
+    default: ${{ github.token }}
+  commitor-api-key:
+    description: >-
+      Commitor API key (from the Commitor dashboard). Store it as a repo
+      secret, e.g. secrets.COMMITOR_API_KEY, and pass it here. Required —
+      without it the scan can't reach the backend.
+    required: true
+  strict:
+    description: >-
+      If "true", fail the check when Commitor reports a mixed (split-
+      worthy) PR, so it shows as a failing status.
+    default: "false"
+    required: false
+  api-url:
+    description: >-
+      Optional override for the Commitor backend URL. Leave empty to use
+      the production default.
+    default: ""
+    required: false
+  version:
+    description: >-
+      Pinned commitor release tag to download (e.g. v0.4.0). Always pin
+      this deliberately — never pull "latest" in CI, so upgrades are a
+      conscious choice you review in the PR that bumps it.
+    default: v0.4.0
+    required: false
+runs:
+  using: composite
+  steps:
+    - name: Download commitor
+      id: download
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        case "$RUNNER_OS" in
+          Linux)   ARCH_PART="unknown-linux-gnu" ;;
+          macOS)   ARCH_PART="apple-darwin" ;;
+          Windows) ARCH_PART="pc-windows-msvc" ;;
+          *) echo "Unsupported runner OS: $RUNNER_OS" >&2; exit 1 ;;
+        esac
+        case "$RUNNER_ARCH" in
+          X64)   ARCH="x86_64" ;;
+          ARM64) ARCH="aarch64" ;;
+          *)     ARCH="$RUNNER_ARCH" ;;
+        esac
+        TRIPLE="${ARCH}-${ARCH_PART}"
+        EXT=""
+        if [ "$RUNNER_OS" = "Windows" ]; then EXT=".exe"; fi
+        ASSET="commitor-${TRIPLE}${EXT}"
+
+        BIN_DIR="$RUNNER_TEMP/commitor-bin"
+        mkdir -p "$BIN_DIR"
+        echo "Downloading ${ASSET} (${VERSION})"
+        gh release download "$VERSION" \
+          --repo Commitor-AI/commitor \
+          --pattern "$ASSET" \
+          --dir "$BIN_DIR"
+        # The asset keeps its triple-bearing name; rename to a stable
+        # `commitor` so it resolves on PATH in the later steps.
+        mv "$BIN_DIR/${ASSET}" "$BIN_DIR/commitor${EXT}"
+        if [ "$RUNNER_OS" != "Windows" ]; then chmod +x "$BIN_DIR/commitor${EXT}"; fi
+        # Put the downloaded binary on PATH for the later steps.
+        echo "$BIN_DIR" >> "$GITHUB_PATH"
+
+    - name: Log in to Commitor
+      shell: bash
+      run: commitor login --key "${{ inputs.commitor-api-key }}"
+
+    - name: Analyze PR and post comment
+      if: ${{ github.event_name == 'pull_request' }}
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        COMMITOR_API_URL: ${{ inputs.api-url }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
+        BASE_REF: ${{ github.base_ref }}
+        STRICT: ${{ inputs.strict }}
+        PR_TITLE: ${{ github.event.pull_request.title }}
+        PR_BODY: ${{ github.event.pull_request.body }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        RANGE="origin/${BASE_REF}...HEAD"
+        # Make sure the base ref exists locally so the symmetric diff
+        # (changes on HEAD since it diverged from base) resolves.
+        git fetch --no-tags origin "${BASE_REF}" || true
+
+        STRICT_FLAG=""
+        if [ "$STRICT" = "true" ]; then STRICT_FLAG="--strict"; fi
+
+        # Pass the PR's stated intent (title + description) as context so
+        # the model can weigh it against the files actually touched.
+        CONTEXT="$PR_TITLE"
+        if [ -n "${PR_BODY:-}" ]; then
+          CONTEXT="${PR_TITLE}
+
+${PR_BODY}"
+        fi
+
+        OUTFILE="$(mktemp)"
+        # Capture both output and exit code; we still want to post the
+        # comment even if the scan (e.g. strict failure) exits non-zero.
+        set +e
+        commitor scan --diff-range "$RANGE" --markdown --context "$CONTEXT" $STRICT_FLAG >"$OUTFILE" 2>&1
+        SCAN_RC=$?
+        set -e
+
+        BODY="$(cat "$OUTFILE")"
+
+        # Find an existing Commitor comment (marked) to update in place,
+        # so we don't post a fresh comment on every push.
+        MARKER='<!-- commitor-analysis -->'
+        EXISTING_ID=""
+        if [ -n "$PR_NUMBER" ]; then
+          COMMENTS="$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments")"
+          EXISTING_ID="$(printf '%s' "$COMMENTS" | jq -r --arg m "$MARKER" \
+            '.[] | select((.body // "") | contains($m)) | .id' | head -n1)"
+        fi
+
+        if [ -n "$EXISTING_ID" ]; then
+          echo "Updating existing Commitor comment ($EXISTING_ID)"
+          curl -sS -X PATCH -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg b "$BODY" '{body: $b}')" \
+            "https://api.github.com/repos/$REPO/issues/comments/$EXISTING_ID" >/dev/null
+        else
+          echo "Posting new Commitor comment"
+          curl -sS -X POST -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg b "$BODY" '{body: $b}')" \
+            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments" >/dev/null
+        fi
+
+        if [ "$STRICT" = "true" ] && [ "$SCAN_RC" -ne 0 ]; then
+          echo "::error::Commitor found a mixed PR and strict mode is enabled — failing the check."
+          exit 1
+        fi
