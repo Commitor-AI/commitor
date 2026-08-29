@@ -6,6 +6,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project is in 0.x, minor versions may add, change, or remove
 functionality freely; 1.0.0 marks a stable command surface.
 
+## [0.5.0] — 2026-08-29
+
+### Added
+- `commitor revert` — undo commits produced by `commitor commit`. Unpushed
+  commits are rolled back with a hard reset; already-pushed commits are
+  reverted with `git revert`, respecting the safety of shared history.
+- `commitor scan --diff-range <RANGE>` — analyze a fixed git range
+  (e.g. `origin/main...HEAD`) instead of the working tree, plus `--markdown`
+  output suited to a PR comment.
+- `commitor scan --context "<title/description>"` — forward a PR's stated
+  intent to the model so it can weigh it against the files actually touched.
+- Post-commit push in `commitor commit` — after committing, offers to push
+  the new branch, auto-detecting the upstream.
+- Per-repo session history of `commitor commit` runs, stored at
+  `~/.commitor/history/<repo-id>.jsonl`.
+- GitHub Action (`./action`) that runs `commitor scan --diff-range` on pull
+  requests and posts an updatable Markdown comment.
+
+### Changed
+- `commitor commit` gains interactive branch selection, base-branch tracking,
+  and an offline mode.
+
+### Improved
+- PR-scale analysis: `--diff-range` scans now always consult the backend
+  (the local heuristic is advisory only at PR scale), so unrelated changes
+  bundled in a large diff are no longer missed.
+
+### Fixed
+- Release workflow (`publish.yml`) is now idempotent — re-running a release
+  no longer fails on an already-published crates.io / npm version.
+
 ## [0.4.0] — 2026-08-29
 
 ### Added
@@ -157,5 +188,11 @@ not of the full tool.
 - `commitor scan` and `commitor commit` — in active development,
   coming in future 0.x releases.
 
+[0.5.0]: https://github.com/Commitor-AI/commitor/releases/tag/v0.5.0
+[0.4.0]: https://github.com/Commitor-AI/commitor/releases/tag/v0.4.0
+[0.3.3]: https://github.com/Commitor-AI/commitor/releases/tag/v0.3.3
+[0.3.2]: https://github.com/Commitor-AI/commitor/releases/tag/v0.3.2
+[0.3.1]: https://github.com/Commitor-AI/commitor/releases/tag/v0.3.1
+[0.3.0]: https://github.com/Commitor-AI/commitor/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Commitor-AI/commitor/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Commitor-AI/commitor/releases/tag/v0.1.0
