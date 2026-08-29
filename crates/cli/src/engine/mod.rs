@@ -4,6 +4,7 @@
 #[allow(dead_code)]
 pub mod gemini;
 pub mod git;
+pub mod history;
 pub mod hunks;
 #[allow(dead_code)]
 pub mod grouping;

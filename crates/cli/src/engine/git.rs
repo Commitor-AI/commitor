@@ -58,6 +58,24 @@ pub fn changed_files(staged: bool) -> Result<Vec<String>> {
         .collect())
 }
 
+/// Changed file paths for a git range, one per line
+/// (`git diff <range> --name-only`).
+pub fn changed_files_range(range: &str) -> Result<Vec<String>> {
+    let out = run_git(&["diff", range, "--name-only"])?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// The full patch text for a git range (`git diff <range>`), used by
+/// `scan --diff-range` to analyze a PR/branch window.
+pub fn diff_range(range: &str) -> Result<String> {
+    run_git(&["diff", range])
+}
+
 /// Stage exactly the given paths (`git add -- <paths>`).
 ///
 /// The `--` separator keeps paths starting with `-` from being read
@@ -217,6 +235,124 @@ pub fn checkout_branch(branch: &str) -> Result<()> {
 /// to the new branch by git.
 pub fn create_branch(branch: &str) -> Result<()> {
     run_git(&["checkout", "-b", branch]).map(drop)
+}
+
+/// Full SHA of the current HEAD (`git rev-parse HEAD`).
+pub fn head_sha() -> Result<String> {
+    run_git(&["rev-parse", "HEAD"]).map(|s| s.trim().to_string())
+}
+
+/// Current branch name, or `None` in a detached HEAD / unborn repo.
+pub fn current_branch() -> Result<Option<String>> {
+    let out = run_git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let name = out.trim().to_string();
+    if name.is_empty() || name == "HEAD" {
+        Ok(None)
+    } else {
+        Ok(Some(name))
+    }
+}
+
+/// Absolute path of the repo root (`git rev-parse --show-toplevel`).
+pub fn repo_toplevel() -> Result<String> {
+    run_git(&["rev-parse", "--show-toplevel"]).map(|s| s.trim().to_string())
+}
+
+/// The `origin` remote's URL, or `None` if the repo has no `origin` or
+/// it isn't configured. Used to derive a stable per-repo history id.
+pub fn remote_url() -> Result<Option<String>> {
+    let output = Command::new("git")
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+        .context("failed to execute `git` — is git installed and in PATH?")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(if url.is_empty() { None } else { Some(url) })
+}
+
+/// True when the working tree has tracked, uncommitted changes. Untracked
+/// files are intentionally ignored: a hard reset leaves them in place, so
+/// they are never at risk from a revert/reset.
+pub fn has_uncommitted_changes() -> Result<bool> {
+    let out = run_git(&["status", "--porcelain", "-uno"])?;
+    Ok(!out.trim().is_empty())
+}
+
+/// True when `sha` has been pushed to a remote-tracking branch (i.e. it
+/// shows up in `git branch -r --contains <sha>`). Fails clearly when the
+/// commit no longer exists — usually a rebase or a `reset --hard` upstream
+/// has rewritten history out from under the recorded session.
+pub fn check_pushed(sha: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .args(["branch", "-r", "--contains", sha])
+        .output()
+        .context("failed to execute `git` — is git installed and in PATH?")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "commit {} could not be found in this repository — it may have been rewritten \
+             or removed by a rebase or a hard reset since `commitor commit` created it. \
+             History cannot be reverted safely. ({})",
+            sha,
+            stderr.trim()
+        );
+    }
+    let out = String::from_utf8_lossy(&output.stdout);
+    Ok(!out.trim().is_empty())
+}
+
+/// Create a revert commit for `sha` without opening an editor.
+pub fn revert_commit(sha: &str) -> Result<()> {
+    run_git(&["revert", "--no-edit", sha]).map(drop)
+}
+
+/// Move HEAD and the index/working tree to `sha` (`git reset --hard`).
+pub fn reset_hard(sha: &str) -> Result<()> {
+    run_git(&["reset", "--hard", sha]).map(drop)
+}
+
+/// SHA of the parent of `sha` (`git rev-parse <sha>^`). Fails clearly when
+/// `sha` is a root commit with no parent — there is nothing before it to
+/// reset back to.
+pub fn parent_of(sha: &str) -> Result<String> {
+    let arg = format!("{sha}^");
+    run_git(&["rev-parse", &arg]).map(|s| s.trim().to_string())
+}
+
+/// Name of the current branch's upstream tracking ref (e.g. `origin/main`),
+/// or `None` when the branch has no upstream configured.
+pub fn upstream() -> Option<String> {
+    let out = run_git(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]).ok()?;
+    let name = out.trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// True when a remote with the given name is configured.
+pub fn remote_exists(name: &str) -> bool {
+    Command::new("git")
+        .args(["remote", "get-url", name])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// Push the current branch to its remote. Uses the configured upstream when
+/// one exists; otherwise pushes `-u origin <branch>` to set one up. Fails
+/// clearly on a detached HEAD or when there is no `origin` remote.
+pub fn push_current_branch() -> Result<()> {
+    if upstream().is_some() {
+        run_git(&["push"]).map(drop)
+    } else {
+        let branch = current_branch()?
+            .context("cannot push: HEAD is detached, so there is no branch to push")?;
+        run_git(&["push", "-u", "origin", &branch]).map(drop)
+    }
 }
 
 fn run_git(args: &[&str]) -> Result<String> {

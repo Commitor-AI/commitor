@@ -163,6 +163,26 @@ fn collect_unstaged() -> Result<CollectedDiff> {
     })
 }
 
+/// Collect the diff for an explicit git range (e.g. `origin/main...HEAD`),
+/// used by `scan --diff-range` to analyze a PR/branch window instead of
+/// the working tree. Never includes untracked files — that matches
+/// `scan`'s existing scope, and a fixed range already defines exactly
+/// what to look at, so there is no unstaged/staged flavor to pick.
+pub fn collect_range(range: &str) -> Result<CollectedDiff> {
+    let files = git::changed_files_range(range)?;
+    let patch = if files.is_empty() {
+        String::new()
+    } else {
+        git::diff_range(range)?
+    };
+    Ok(CollectedDiff {
+        staged_used: false,
+        files,
+        patch,
+        untracked: Vec::new(),
+    })
+}
+
 /// Build a synthetic unified-diff section presenting an untracked file
 /// as a brand-new file, so it flows through the normal wire format and
 /// hunk parser without mutating the git index (`no git add -N`).
@@ -227,28 +247,34 @@ impl RateStatus {
     }
 }
 
-/// Run the full backend analysis for `patch`.
+/// Run the full backend analysis for `patch`, optionally forwarding
+/// PR-scoped context (title/description) to the model.
 ///
 /// Loads the stored API key (surfacing the standard not-logged-in
 /// message when absent), applies the size guard, then POSTs to
 /// `/analyze`. This is the entry point `scan` uses once its local
-/// heuristics are inconclusive.
+/// heuristics decide to escalate.
 ///
 /// Returns the response plus the quota snapshot from the response
 /// headers, so commands can warn when the user is close to their
 /// daily limit.
-pub fn analyze_patch(patch: &str) -> Result<(AnalyzeResponse, RateStatus), AnalyzeError> {
+pub fn analyze_patch_with_context(
+    patch: &str,
+    context: Option<&str>,
+) -> Result<(AnalyzeResponse, RateStatus), AnalyzeError> {
     let api_key = auth::load_api_key()?;
-    analyze_with_key(&api_key, patch)
+    analyze_with_key(&api_key, patch, context)
 }
 
-/// Same as [`analyze_patch`] for callers that already loaded the key
-/// (e.g. `commit`, which requires auth before touching any state).
+/// Same as [`analyze_patch_with_context`] for callers that already
+/// loaded the key (e.g. `commit`, which requires auth before touching
+/// any state).
 pub fn analyze_with_key(
     api_key: &str,
     patch: &str,
+    context: Option<&str>,
 ) -> Result<(AnalyzeResponse, RateStatus), AnalyzeError> {
-    analyze_with_mode(api_key, patch, "scan")
+    analyze_with_mode(api_key, patch, "scan", context)
 }
 
 /// Commit passes `mode = "commit"` so the backend never answers with
@@ -257,6 +283,7 @@ pub fn analyze_with_mode(
     api_key: &str,
     patch: &str,
     mode: &str,
+    context: Option<&str>,
 ) -> Result<(AnalyzeResponse, RateStatus), AnalyzeError> {
     enforce_size_guard(api_key, patch)?;
 
@@ -264,7 +291,7 @@ pub fn analyze_with_mode(
         .enable_all()
         .build()
         .map_err(|err| AnalyzeError::Other(anyhow!("failed to start async runtime: {err:#}")))?;
-    runtime.block_on(analyze_request(api_key, patch, mode))
+    runtime.block_on(analyze_request(api_key, patch, mode, context))
 }
 
 /// POST the diff to `{API_BASE_URL}/analyze`.
@@ -272,6 +299,7 @@ async fn analyze_request(
     api_key: &str,
     patch: &str,
     mode: &str,
+    context: Option<&str>,
 ) -> Result<(AnalyzeResponse, RateStatus), AnalyzeError> {
     use reqwest::Client;
 
@@ -283,9 +311,9 @@ async fn analyze_request(
         .map_err(|err| AnalyzeError::Other(anyhow!("failed to set up HTTP client: {err:#}")))?;
 
     let request = auth::with_key(
-        client.post(&url).json(&AnalyzeRequest {
+        client.post(&url)        .json(&AnalyzeRequest {
             diff: patch,
-            context: None,
+            context,
             mode: Some(mode),
         }),
         api_key,

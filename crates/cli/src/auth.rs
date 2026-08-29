@@ -10,15 +10,13 @@
 //! hosted API ships).
 
 use std::fs;
-use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::mpsc;
-use std::thread;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
+use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 
 use crate::admin;
 use crate::config;
@@ -302,64 +300,98 @@ fn save_credentials(api_key: &str) -> Result<()> {
 /// doesn't support the redirect (or the browser flow is interrupted), the
 /// user can paste an API key from the dashboard instead.
 pub fn login_interactive() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| anyhow!("failed to start async runtime: {err:#}"))?;
+    runtime.block_on(login_interactive_async())
+}
+
+/// Async heart of [`login_interactive`]: race the browser callback server
+/// against a manual key paste and log in with whichever arrives first.
+async fn login_interactive_async() -> Result<()> {
     let redirect = format!("http://127.0.0.1:{CALLBACK_PORT}/callback");
     let login_url = format!("{FRONTEND_URL}/login?redirect={redirect}");
     println!("Opening your browser to sign in: {login_url}");
     let _ = webbrowser::open(&login_url);
 
-    let (tx, rx) = mpsc::channel::<LoginSource>();
+    // Stand up the local callback server when the port is free; otherwise
+    // fall back to paste-only.
+    let listener = match TcpListener::bind(("127.0.0.1", CALLBACK_PORT)).await {
+        Ok(listener) => {
+            println!("If your browser redirects back here automatically, you're all set.");
+            Some(listener)
+        }
+        Err(_) => {
+            println!("(Couldn't start a local callback server; you'll need to paste your key.)");
+            None
+        }
+    };
 
-    let mut have_server = false;
-    if let Ok(listener) = TcpListener::bind(("127.0.0.1", CALLBACK_PORT)) {
-        have_server = true;
-        let server_tx = tx.clone();
-        thread::spawn(move || {
-            for stream in listener.incoming() {
-                if let Ok(mut stream) = stream {
-                    let mut buf = [0u8; 4096];
-                    let _ = stream.read(&mut buf);
-                    let req = String::from_utf8_lossy(&buf);
-                    if let Some(key) = extract_key(&req) {
-                        let _ = write_connected(&mut stream);
-                        let _ = server_tx.send(LoginSource::Callback(key));
-                        break;
-                    } else {
-                        let _ = write_error(
-                            &mut stream,
-                            "No API key was returned. Run `commitor login` again.",
-                        );
-                    }
-                }
-            }
-        });
-    } else {
-        println!("(Couldn't start a local callback server; you'll need to paste your key.)");
-    }
-
-    if have_server {
-        println!("If your browser redirects back here automatically, you're all set.");
-    }
     println!("Otherwise, paste your API key from {DASHBOARD_URL} and press Enter:");
 
-    let stdin_tx = tx.clone();
-    thread::spawn(move || {
-        let mut line = String::new();
-        if std::io::stdin().read_line(&mut line).is_ok() {
-            let key = line.trim().to_string();
-            if !key.is_empty() {
-                let _ = stdin_tx.send(LoginSource::Manual(key));
-            }
-        }
-    });
+    // `tokio::select!` races the two sources — the first to yield a key
+    // wins, and the losing branch is dropped automatically.
+    let source = match listener {
+        Some(listener) => tokio::select! {
+            key = accept_callback(listener) => LoginSource::Callback(key),
+            key = read_manual_key() => LoginSource::Manual(key),
+        },
+        None => LoginSource::Manual(read_manual_key().await),
+    };
 
-    match rx.recv() {
-        Ok(source) => {
-            let key = match source {
-                LoginSource::Callback(k) | LoginSource::Manual(k) => k,
-            };
-            login(&key)
+    let key = match source {
+        LoginSource::Callback(k) | LoginSource::Manual(k) => k,
+    };
+
+    // `login` performs a blocking network call; keep it off the async
+    // runtime with `spawn_blocking` so it can't stall other tasks.
+    tokio::task::spawn_blocking(move || login(&key))
+        .await
+        .map_err(|err| anyhow!("login task failed: {err}"))?
+}
+
+/// Accept a single connection on the callback listener, pull the key out
+/// of the redirect, and confirm success to the browser. If no usable key
+/// arrives the future never resolves, so the manual-paste branch wins the
+/// `select!` race instead.
+async fn accept_callback(listener: TcpListener) -> String {
+    let (mut stream, _) = match listener.accept().await {
+        Ok(pair) => pair,
+        Err(_) => std::future::pending().await,
+    };
+
+    let mut buf = [0u8; 4096];
+    let _ = stream.read(&mut buf).await;
+    let req = String::from_utf8_lossy(&buf);
+
+    match extract_key(&req) {
+        Some(key) => {
+            let _ = write_connected(&mut stream).await;
+            key
         }
-        Err(_) => bail!("Login was cancelled."),
+        None => {
+            let _ = write_error(
+                &mut stream,
+                "No API key was returned. Run `commitor login` again.",
+            )
+            .await;
+            std::future::pending().await
+        }
+    }
+}
+
+/// Read a single line from stdin as the manually pasted API key.
+async fn read_manual_key() -> String {
+    let mut line = String::new();
+    if BufReader::new(io::stdin())
+        .read_line(&mut line)
+        .await
+        .is_ok()
+    {
+        line.trim().to_string()
+    } else {
+        String::new()
     }
 }
 
@@ -517,18 +549,18 @@ fn page_html(
 }
 
 /// Write a self-contained HTML document back to the browser redirect.
-fn write_http(stream: &mut impl Write, html: &str) -> std::io::Result<()> {
+async fn write_http(stream: &mut (impl AsyncWrite + Unpin), html: &str) -> std::io::Result<()> {
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\
          \r\nConnection: close\r\n\r\n{html}",
         html.len()
     );
-    stream.write_all(response.as_bytes())
+    AsyncWriteExt::write_all(stream, response.as_bytes()).await
 }
 
 /// Page shown when the browser redirect delivered a valid API key:
 /// the user is connected and can return to the terminal.
-fn write_connected(stream: &mut impl Write) -> std::io::Result<()> {
+async fn write_connected(stream: &mut (impl AsyncWrite + Unpin)) -> std::io::Result<()> {
     const SVG: &str =
         r#"<circle class="ring" cx="26" cy="26" r="24"/><path class="tick" d="M15 27 l7 7 l15 -16"/>"#;
     let html = page_html(
@@ -539,13 +571,13 @@ fn write_connected(stream: &mut impl Write) -> std::io::Result<()> {
         "rgba(198,255,0,.35)",
         SVG,
     );
-    write_http(stream, &html)
+    write_http(stream, &html).await
 }
 
 /// Page shown when the redirect did not carry a key (rare — e.g. the user
 /// navigated to the callback manually). Keeps the same look, in the
 /// critical (red) accent.
-fn write_error(stream: &mut impl Write, msg: &str) -> std::io::Result<()> {
+async fn write_error(stream: &mut (impl AsyncWrite + Unpin), msg: &str) -> std::io::Result<()> {
     const SVG: &str =
         r#"<circle class="ring" cx="26" cy="26" r="24"/><path class="tick" d="M17 17 l18 18 M35 17 l-18 18"/>"#;
     let html = page_html(
@@ -556,7 +588,7 @@ fn write_error(stream: &mut impl Write, msg: &str) -> std::io::Result<()> {
         "rgba(244,63,94,.30)",
         SVG,
     );
-    write_http(stream, &html)
+    write_http(stream, &html).await
 }
 
 /// Remove the stored credentials file, if any.
