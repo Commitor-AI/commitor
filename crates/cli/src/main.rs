@@ -4,6 +4,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+mod admin;
 mod analysis;
 mod auth;
 mod commit;
@@ -69,6 +70,17 @@ enum Commands {
     },
     /// Update commitor to the latest release
     Update,
+    /// Show or change the local admin role status
+    Admin {
+        /// `revoke` to disable the role; omit to show the current status
+        #[arg(default_value = "status")]
+        action: String,
+    },
+    /// Self-grant a capability, e.g. `commitor gimme admin`
+    Gimme {
+        /// Capability to grant (`admin`)
+        capability: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -136,6 +148,32 @@ fn execute(command: Commands) -> Result<ExitCode, Option<anyhow::Error>> {
             commit::run(commit::CommitFlags { all, offline, branch }).map_err(Some)
         }
         Commands::Update => run_update().map(|_| ExitCode::SUCCESS).map_err(Some),
+        Commands::Admin { action } => match action.as_str() {
+            "status" => admin::status().map(|_| ExitCode::SUCCESS).map_err(Some),
+            "revoke" => admin::revoke_admin().map(|_| ExitCode::SUCCESS).map_err(Some),
+            other => {
+                eprintln!("error: unknown admin action `{other}` (try `status` or `revoke`)");
+                Err(Some(anyhow::anyhow!("unknown admin action")))
+            }
+        },
+        Commands::Gimme { capability } => match capability.as_str() {
+            "admin" => {
+                let api_key = auth::load_api_key().map_err(Some)?;
+                if auth::backend_is_admin(&api_key)? {
+                    admin::grant_admin().map(|_| ExitCode::SUCCESS).map_err(Some)
+                } else {
+                    eprintln!(
+                        "error: your account is not verified as an admin by the backend.\n\
+                         Only backend-verified accounts can be granted admin."
+                    );
+                    Err(Some(anyhow::anyhow!("account not verified as admin")))
+                }
+            }
+            other => {
+                eprintln!("error: unknown capability `{other}` (try `admin`)");
+                Err(Some(anyhow::anyhow!("unknown capability")))
+            }
+        },
     }
 }
 

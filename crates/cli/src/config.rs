@@ -1,4 +1,29 @@
-//! Shared runtime configuration (API location).
+//! Shared runtime configuration (API location, local data dir).
+
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
+
+/// Directory where commitor keeps local state (`~/.commitor` on Unix,
+/// `%USERPROFILE%/.commitor` on Windows). Every file in here is created
+/// with restricted permissions.
+pub fn commitor_dir() -> Result<PathBuf> {
+    let base = home_dir()?;
+    Ok(base.join(".commitor"))
+}
+
+#[cfg(unix)]
+fn home_dir() -> Result<PathBuf> {
+    let home = std::env::var("HOME").context("HOME is not set — where should state be stored?")?;
+    Ok(PathBuf::from(home))
+}
+
+#[cfg(windows)]
+fn home_dir() -> Result<PathBuf> {
+    let profile = std::env::var("USERPROFILE")
+        .context("USERPROFILE is not set — where should state be stored?")?;
+    Ok(PathBuf::from(profile))
+}
 
 /// Backend the CLI talks to. Local development default; flip to the
 /// hosted URL (e.g. `https://api.commitor.dev`) before shipping a

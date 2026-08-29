@@ -6,6 +6,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project is in 0.x, minor versions may add, change, or remove
 functionality freely; 1.0.0 marks a stable command surface.
 
+## [0.4.0] — 2026-08-29
+
+### Added
+
+- **Backend-verified admin role.** `commitor gimme admin` asks the
+  backend to confirm your account (against its admin allowlist) before
+  caching the grant locally — it can never be self-granted by editing a
+  file. `commitor admin` shows status, `commitor admin revoke` removes
+  it, and `whoami` reports the verified state. A verified admin unlocks
+  every pro feature (`effective_plan` returns `admin`).
+- **Retry prompts on failure.** When the AI analysis is temporarily
+  unavailable, or the model returns an inconsistent split, `commitor
+  commit` now offers `[r]etry · [o]ffline · [c]ancel` instead of
+  silently degrading — up to a few attempts before falling back.
+
+### Improved
+
+- **Conventional Commits are now split at hunk granularity.** A modified
+  file that mixes an added feature with an edit is split so the additions
+  commit as `feat` and the edits as `fix`, via `partial_files`.
+- **Crate-aware scopes.** A crate's source root collapses to the crate
+  name — `crates/cli/src/...` scopes to `cli` (and `crates/cli/src/auth`
+  to `cli/auth`) instead of the uninformative `src`.
+- **Model path-repair.** Abbreviated paths the model returns (a basename,
+  or `./`/`b/` prefixes) are matched back to the real changed files, so a
+  salvageable AI split is used rather than rejected and forced into the
+  coarse offline fallback.
+- The offline splitter now mirrors the backend's local tier (same scopes,
+  same hunk-level splitting), so `--offline` and `scan` read consistently.
+
 ## [0.3.3] — 2026-08-28
 
 ### Added

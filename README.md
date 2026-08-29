@@ -35,7 +35,34 @@ refused rather than committed.
 | `commitor commit -b` | As above, but first pick (or create) the branch to commit to |
 | `commitor update` | Check GitHub for a newer release and install it |
 | `commitor version` | Print the installed version (`--version`, `-V` also work) |
+| `commitor admin` | Show whether the local admin role is enabled |
+| `commitor gimme admin` | Grant the local admin role (unlocks all pro features) |
 | `commitor help` | Show usage help |
+
+### Admin and pro features
+
+Admin is a **backend-verified** privilege. The source of truth is the
+backend: `GET /auth/me` reports whether your account is an admin, and the
+local `~/.commitor/admin.toml` only ever records a verified result — it
+can't be self-granted. To activate it:
+
+```sh
+commitor login                 # must already be done
+commitor gimme admin           # backend verifies your account as admin
+```
+
+If the backend does not report your account as an admin, `gimme admin`
+refuses with an error. While the (verified) role is active, `commitor
+whoami` reports `admin` as the effective plan and every pro feature is
+unlocked on that machine, regardless of the account's plan. Revoke it any
+time:
+
+```sh
+commitor admin revoke
+```
+
+`commitor whoami` re-checks the backend, so a cached grant that the
+backend has since revoked is flagged instead of silently trusted.
 
 ### scan flags
 

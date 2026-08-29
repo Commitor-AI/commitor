@@ -20,6 +20,7 @@ use anyhow::{bail, Context, Result};
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
 
+use crate::admin;
 use crate::config;
 
 /// Where users manage their keys — shown in error messages.
@@ -44,6 +45,9 @@ struct StoredCredentials {
 struct MeResponse {
     email: String,
     plan: Option<String>,
+    /// Whether the backend recognizes this account as an admin. Older
+    /// backends omit the field; treat its absence as `false`.
+    admin: Option<bool>,
 }
 
 /// Backend base URL, e.g. `http://localhost:8000` (no trailing slash).
@@ -77,6 +81,45 @@ fn not_logged_in_error() -> anyhow::Error {
         "Not logged in. Run `commitor login` (opens your browser) or \
          `commitor login --key <your-key>` — get a key at {DASHBOARD_URL}"
     )
+}
+
+/// Plan string behind an already-loaded key, defaulting to `"free"`
+/// when the backend omits the field (older backends). Network/404
+/// failures surface as errors so callers can decide how to degrade.
+pub fn plan_for_key(api_key: &str) -> Result<String> {
+    let me = fetch_me(api_key)?;
+    Ok(me.plan.unwrap_or_else(|| "free".to_string()))
+}
+
+/// Does the backend recognize `api_key`'s account as an admin? This is
+/// the *source of truth* for admin status — the local admin file is only
+/// ever written after this returns `true`, so being "admin" means the
+/// backend verified you, not that a file was dropped on disk.
+pub fn backend_is_admin(api_key: &str) -> Result<bool> {
+    let me = fetch_me(api_key)?;
+    Ok(me.admin.unwrap_or(false))
+}
+
+/// Plans that unlock Commitor's pro features.
+pub const PRO_PLANS: &[&str] = &["pro", "team", "enterprise"];
+
+/// Does `plan` grant access to pro features? `admin` is also a pro plan,
+/// because the admin role is meant to unlock everything.
+pub fn has_pro_access(plan: &str) -> bool {
+    let plan = plan.trim().to_ascii_lowercase();
+    plan == "admin" || PRO_PLANS.contains(&plan.as_str())
+}
+
+/// The effective plan for the stored key, overriding the backend plan
+/// with `"admin"` whenever the (backend-verified) local admin role is
+/// granted. This is the value callers should consult when deciding
+/// feature access: a verified admin always reaches every pro feature,
+/// even on a `free` account.
+pub fn effective_plan(api_key: &str) -> Result<String> {
+    if admin::is_admin() {
+        return Ok("admin".to_string());
+    }
+    plan_for_key(api_key)
 }
 
 /// Load the stored API key.
@@ -536,8 +579,30 @@ pub fn logout() -> Result<()> {
 pub fn whoami() -> Result<()> {
     let api_key = load_api_key()?;
     let me = fetch_me(&api_key)?;
-    let plan = me.plan.unwrap_or_else(|| "free".to_string());
-    println!("{} — {} plan", me.email, plan);
+    let raw_plan = me.plan.unwrap_or_else(|| "free".to_string());
+    let backend_admin = me.admin.unwrap_or(false);
+    let local_admin = admin::is_admin();
+
+    if local_admin {
+        if backend_admin {
+            println!("{} — {} plan", me.email, raw_plan);
+            println!("admin: verified by backend — all pro features unlocked.");
+        } else {
+            println!("{} — {} plan", me.email, raw_plan);
+            println!(
+                "admin: a local grant is cached, but the backend no longer \
+                 reports this account as admin. Run `commitor admin revoke`."
+            );
+        }
+    } else if backend_admin {
+        println!("{} — {} plan", me.email, raw_plan);
+        println!("admin: verified by backend, but not activated locally. Run `commitor gimme admin`.");
+    } else {
+        let plan = effective_plan(&api_key)?;
+        let pro = if has_pro_access(&plan) { "yes" } else { "no" };
+        println!("{} — {} plan", me.email, plan);
+        println!("pro features: {pro}");
+    }
     Ok(())
 }
 

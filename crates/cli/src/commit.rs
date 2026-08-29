@@ -22,7 +22,7 @@
 // pathological overlaps would fail loudly and hit the partial-failure
 // report. Untracked files never need patches (plain `git add`).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Write};
 use std::process::ExitCode;
 
@@ -42,6 +42,13 @@ pub struct CommitFlags {
     /// Pick (or create) the branch to commit to before committing.
     pub branch: bool,
 }
+
+/// Total attempts at the AI backend before we give up and degrade to the
+/// offline plan (initial try + retry prompts).
+const MAX_AI_ATTEMPTS: usize = 4;
+/// Total passes at building/validating a plan before we stop offering to
+/// retry and fall back to a single offline commit.
+const MAX_PLAN_ATTEMPTS: usize = 3;
 
 pub fn run(flags: CommitFlags) -> Result<ExitCode> {
     // ── 1. Collect the diff ─────────────────────────────────────────
@@ -113,102 +120,172 @@ pub fn run(flags: CommitFlags) -> Result<ExitCode> {
 
     // ── 3. Backend analysis — always, even if heuristics look clean ─
     // mode="commit": the backend never answers with its deterministic
-    // tier; commits get model-written messages.
-    let (response, rate) = match analysis::analyze_with_mode(&api_key, &collected.patch, "commit") {
-        Ok(ok) => ok,
-        // Quota gone or AI unreachable: degrade to an offline plan so a
-        // commit is never blocked by the service. Auth problems are NOT
-        // degraded — they need fixing.
-        Err(analysis::AnalyzeError::RateLimited(reason))
-        | Err(analysis::AnalyzeError::Unavailable(reason)) => {
-            println!();
-            println!("AI analysis unavailable — {reason}");
-            println!("Falling back to an offline plan; rerun later for an AI-crafted message.");
-            return commit_offline(&collected, &baseline);
+    // tier; commits get model-written messages. Transient service errors
+    // (quota/availability) prompt a retry rather than silently degrading.
+    let (mut response, mut rate) = {
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match analysis::analyze_with_mode(&api_key, &collected.patch, "commit") {
+                Ok(ok) => break ok,
+                // Quota gone or AI unreachable: offer to retry, fall back
+                // to an offline plan, or cancel — never block the commit
+                // silently. Auth problems are NOT retried; they need fixing.
+                Err(analysis::AnalyzeError::RateLimited(reason))
+                | Err(analysis::AnalyzeError::Unavailable(reason)) => {
+                    if attempts >= MAX_AI_ATTEMPTS {
+                        println!();
+                        println!("AI analysis still unavailable after {attempts} tries — {reason}");
+                        println!("Falling back to an offline plan; rerun later for an AI-crafted message.");
+                        return commit_offline(&collected, &baseline);
+                    }
+                    match prompt_retry(&format!("AI analysis unavailable — {reason}"))? {
+                        RetryDecision::Retry => continue,
+                        RetryDecision::Offline => {
+                            println!("Falling back to an offline plan.");
+                            return commit_offline(&collected, &baseline);
+                        }
+                        RetryDecision::Cancel => {
+                            println!("Commit cancelled, nothing was changed.");
+                            return Ok(ExitCode::SUCCESS);
+                        }
+                    }
+                }
+                Err(err) => return Err(err.into()),
+            }
         }
-        Err(err) => return Err(err.into()),
     };
 
     // The plan must describe the tree as it is right now; bail before
     // showing the user anything built on stale data.
     ensure_tree_unchanged(&baseline)?;
 
-    // ── 4. Build and validate the plan BEFORE showing or running it ─
-    let file_diffs = hunks::parse(&collected.patch);
-    let mut plan = build_plan(&response.groups);
+    // ── 4/5. Build, validate, and act on the plan ──────────────────
+    // The model can return an internally inconsistent split (a file
+    // claimed twice, or a hunk left unassigned). On failure we offer to
+    // re-request a fresh split (the model is nondeterministic) before
+    // degrading to the offline plan.
+    let mut plan_attempt: usize = 0;
+    loop {
+        let file_diffs = hunks::parse(&collected.patch);
+        // The model sometimes returns abbreviated paths (a basename, or a
+        // `./`/`b/` prefix) that don't match the diff verbatim. Repair them
+        // against the actual changed-file set so a salvageable AI split isn't
+        // thrown away and forced into the coarse offline fallback.
+        let actual_paths: HashSet<String> = collected.files.iter().cloned().collect();
+        normalize_group_paths(&mut response.groups, &actual_paths);
+        let mut plan = build_plan(&response.groups);
 
-    if let Err(err) = hunks::validate(&file_diffs, &plan, &collected.files) {
-        // The model's proposed split was internally inconsistent (e.g.
-        // a file claimed by two groups, or a partial claim that left a
-        // hunk unassigned). Rather than refuse and force the user into
-        // an endless re-run loop, degrade safely: commit everything in
-        // a single commit — reusing the same approved single-commit
-        // flow, so no change is ever lost or duplicated.
-        println!();
-        println!(
-            "note: the suggested split was inconsistent ({err}), so all changes\n\
-             will be committed in a single commit instead of being refused.\n\
-             Re-run later (or use `commitor commit --offline`) for an AI split."
-        );
-        let mut single = vec![PlanGroup {
-            message: offline_commit_message(&collected),
-            whole: collected.files.clone(),
-            partial: Vec::new(),
-        }];
-        return commit_single(
-            &mut single,
-            &file_diffs,
-            collected.staged_used,
-            &baseline,
-        );
-    }
-
-    // ── 5. Act on the verdict ───────────────────────────────────────
-    let code = if response.groups.len() <= 1 {
-        commit_single(&mut plan, &file_diffs, collected.staged_used, &baseline)?
-    } else {
-        commit_split(
-            &response.groups,
-            local_hint.as_deref(),
-            &mut plan,
-            &file_diffs,
-            collected.staged_used,
-            &baseline,
-        )?
-    };
-
-    // Soft quota hint, only after a fully successful run (stderr, so
-    // scripted consumers of stdout are unaffected).
-    if code == ExitCode::SUCCESS {
-        if let Some(message) = rate.low_quota_message() {
-            eprintln!();
-            eprintln!("{message}");
+        if let Err(err) = hunks::validate(&file_diffs, &plan, &collected.files) {
+            plan_attempt += 1;
+            if plan_attempt >= MAX_PLAN_ATTEMPTS {
+                println!();
+                println!(
+                    "note: the suggested split was still inconsistent ({err}), so all changes\n\
+                     will be committed in a single commit instead of being refused.\n\
+                     Re-run later (or use `commitor commit --offline`) for an AI split."
+                );
+                let plan = offline_groups(&collected);
+                return run_offline_plan(plan, &file_diffs, collected.staged_used, &baseline);
+            }
+            match prompt_retry(&format!(
+                "The suggested split was inconsistent ({err}). Retry for a fresh split?"
+            ))? {
+                RetryDecision::Retry => {
+                    println!("Re-requesting an analysis…");
+                    match analysis::analyze_with_mode(&api_key, &collected.patch, "commit") {
+                        Ok(ok) => {
+                            response = ok.0;
+                            rate = ok.1;
+                            continue;
+                        }
+                        Err(analysis::AnalyzeError::RateLimited(reason))
+                        | Err(analysis::AnalyzeError::Unavailable(reason)) => {
+                            println!("AI unavailable ({reason}) — falling back to an offline plan.");
+                            let plan = offline_groups(&collected);
+                            return run_offline_plan(plan, &file_diffs, collected.staged_used, &baseline);
+                        }
+                        Err(err) => return Err(err.into()),
+                    }
+                }
+                RetryDecision::Offline => {
+                    let plan = offline_groups(&collected);
+                    return run_offline_plan(plan, &file_diffs, collected.staged_used, &baseline);
+                }
+                RetryDecision::Cancel => {
+                    println!("Commit cancelled, nothing was changed.");
+                    return Ok(ExitCode::SUCCESS);
+                }
+            }
         }
-    }
 
-    Ok(code)
+        let code = if response.groups.len() <= 1 {
+            commit_single(&mut plan, &file_diffs, collected.staged_used, &baseline)?
+        } else {
+            commit_split(
+                &response.groups,
+                local_hint.as_deref(),
+                &mut plan,
+                &file_diffs,
+                collected.staged_used,
+                &baseline,
+            )?
+        };
+
+        // Soft quota hint, only after a fully successful run (stderr, so
+        // scripted consumers of stdout are unaffected).
+        if code == ExitCode::SUCCESS {
+            if let Some(message) = rate.low_quota_message() {
+                eprintln!();
+                eprintln!("{message}");
+            }
+        }
+
+        return Ok(code);
+    }
 }
 
 /// Build a single-group plan locally: every changed file whole, one
-/// commit, message derived from the diff headers. Used for explicit
+/// commit, messages derived from the diff structure. Used for explicit
 /// `--offline` runs and as the automatic fallback when the AI is
-/// unavailable (quota exhausted, backend down). Splitting needs the
-/// model — offline always proposes exactly one commit.
+/// unavailable (quota exhausted, backend down). It splits the diff into
+/// one commit per `(type, scope)` (features, fixes, and the remainder in
+/// their own commits) using only local heuristics.
 fn commit_offline(collected: &analysis::CollectedDiff, baseline: &str) -> Result<ExitCode> {
     ensure_tree_unchanged(baseline)?;
     let file_diffs = hunks::parse(&collected.patch);
-    let mut plan = vec![PlanGroup {
-        message: offline_commit_message(collected),
-        whole: collected.files.clone(),
-        partial: Vec::new(),
-    }];
-    if let Err(err) = hunks::validate(&file_diffs, &plan, &collected.files) {
+    let plan = offline_groups(collected);
+    run_offline_plan(plan, &file_diffs, collected.staged_used, baseline)
+}
+
+/// Validate an offline-derived plan and execute it, committing each
+/// `(type, scope)` group separately when there's more than one.
+fn run_offline_plan(
+    mut plan: Vec<PlanGroup>,
+    file_diffs: &[FileDiff],
+    staged_used: bool,
+    baseline: &str,
+) -> Result<ExitCode> {
+    if let Err(err) = hunks::validate(file_diffs, &plan, &plan_files(&plan)) {
         bail!(
             "The offline plan doesn't match the actual diff:\n  {err:#}\n\n\
              Nothing was staged or committed."
         );
     }
-    commit_single(&mut plan, &file_diffs, collected.staged_used, baseline)
+    if plan.len() <= 1 {
+        commit_single(&mut plan, file_diffs, staged_used, baseline)
+    } else {
+        commit_split(&[], None, &mut plan, file_diffs, staged_used, baseline)
+    }
+}
+
+/// Flatten the file list across all groups, for plan validation.
+fn plan_files(plan: &[PlanGroup]) -> Vec<String> {
+    let mut files = Vec::new();
+    for group in plan {
+        files.extend(group.whole.iter().cloned());
+    }
+    files
 }
 
 /// Derive a short, human-readable list of "verb file" actions from the
@@ -245,30 +322,369 @@ fn diff_actions(collected: &analysis::CollectedDiff) -> Vec<String> {
     actions
 }
 
-/// Deterministic message naming what each file does ("add auth.py;
-/// update api.py"), prefixed with the common top-level directory when
-/// there is one. Same spirit as the backend's local tier.
+/// Deterministic, Conventional-Commits plan derived purely from the diff
+/// — used by the offline path and the "inconsistent plan" fallback.
+///
+/// The changeset is split into one commit per `(type, scope)` so distinct
+/// features, distinct fixes, and the remaining changes each land in their
+/// own commit instead of being mashed into one. Each commit reads like
+/// `feat(auth): add login` rather than a flat file listing.
+///
+/// Classification rules (in priority order):
+/// - every changed file is a test   → `test`
+/// - every changed file is docs     → `docs`
+/// - every changed file is build/cfg→ `build`
+/// - new functionality              → `feat`: a new source file, *or* code
+///   added to existing files (pure additions, no removals)
+/// - only modifications/edits       → `fix`, unless it's a large
+///   restructure (more lines removed than added across many files) →
+///   `refactor`
+fn offline_groups(collected: &analysis::CollectedDiff) -> Vec<PlanGroup> {
+    let changes = parse_file_changes(collected);
+    if changes.is_empty() {
+        return vec![PlanGroup {
+            message: format!("{}: update working changes", ChangeType::Chore),
+            whole: collected.files.clone(),
+            partial: Vec::new(),
+        }];
+    }
+
+    // One commit per (type, scope): features in different directories,
+    // fixes, and the misc remainder become separate commits.
+    let mut buckets: BTreeMap<(ChangeType, Option<String>), Vec<FileChange>> = BTreeMap::new();
+    for change in changes {
+        let change_type = classify_change(std::slice::from_ref(&change));
+        let scope = scope_for(&change.path);
+        buckets.entry((change_type, scope)).or_default().push(change);
+    }
+
+    buckets
+        .into_iter()
+        .map(|((change_type, scope), bucket_changes)| {
+            let files: Vec<String> = bucket_changes.iter().map(|c| c.path.clone()).collect();
+            let prefix = match scope {
+                Some(scope) => format!("{change_type}({scope})"),
+                None => change_type.to_string(),
+            };
+            PlanGroup {
+                message: format!("{prefix}: {}", subject_line(&bucket_changes)),
+                whole: files,
+                partial: Vec::new(),
+            }
+        })
+        .collect()
+}
+
+/// Single-message view of the offline plan (first group), kept for the
+/// deterministic fallback where a lone commit is expected.
+#[allow(dead_code)]
 fn offline_commit_message(collected: &analysis::CollectedDiff) -> String {
-    let actions = diff_actions(collected);
-    if actions.is_empty() {
-        return "chore: update working changes".to_string();
-    }
+    offline_groups(collected)
+        .into_iter()
+        .next()
+        .map(|g| g.message)
+        .unwrap_or_else(|| format!("{}: update working changes", ChangeType::Chore))
+}
 
-    let listed: Vec<String> = actions.iter().take(5).cloned().collect();
-    let mut summary = listed.join("; ");
-    if actions.len() > 5 {
-        summary += &format!("; +{} more", actions.len() - 5);
-    }
+/// Parent directory of a path. Files at the repo root have no parent
+/// (`None`).
+fn file_scope(path: &str) -> Option<String> {
+    let parts: Vec<&str> = path.split('/').collect();
+    (parts.len() > 1).then(|| parts[..parts.len() - 1].join("/"))
+}
 
-    let tops: Vec<&str> = collected
-        .files
-        .iter()
-        .filter_map(|p| p.split('/').next())
-        .collect();
-    if !tops.is_empty() && tops.iter().all(|t| *t == tops[0]) && !tops[0].is_empty() {
-        format!("chore({}): {}", tops[0], summary)
+/// Conventional-Commits scope for a file: its parent directory with
+/// generic source roots stripped, so scopes read like `auth` or
+/// `cli/auth` instead of `crates/cli/src/auth` (or, worse, `src/src`).
+fn scope_for(path: &str) -> Option<String> {
+    let parent = file_scope(path)?;
+    let trimmed = trim_source_root(&parent);
+    let trimmed = if trimmed.is_empty() { &parent } else { &trimmed };
+    if trimmed.is_empty() {
+        None
     } else {
-        format!("chore: {summary}")
+        Some(trimmed.to_string())
+    }
+}
+
+/// Drop leading boilerplate from a directory: `src/`, `lib/`, `app/`,
+/// `include/`, `tests/`, `test/`, and the `crates/<name>/src` prefix.
+///
+/// A crate's own source root collapses to the crate name — so
+/// `crates/cli/src` becomes `cli` (not the uninformative `src`), while
+/// `crates/cli/src/auth` becomes `cli/auth`.
+fn trim_source_root(dir: &str) -> String {
+    if let Some(rest) = dir.strip_prefix("crates/") {
+        // rest is "<crate>/src/..." or "<crate>/..."; shed to the crate
+        // name plus whatever meaningful directory remains.
+        let mut segs = rest.splitn(2, '/');
+        let crate_name = segs.next().unwrap_or("");
+        if let Some(after) = segs.next() {
+            if after == "src" {
+                return crate_name.to_string();
+            }
+            if let Some(inner) = after.strip_prefix("src/") {
+                if inner.is_empty() {
+                    return crate_name.to_string();
+                }
+                return format!("{crate_name}/{inner}");
+            }
+            return format!("{crate_name}/{after}");
+        }
+        return crate_name.to_string();
+    }
+    for root in ["src/", "lib/", "app/", "include/", "tests/", "test/"] {
+        if let Some(rest) = dir.strip_prefix(root) {
+            return rest.to_string();
+        }
+    }
+    dir.to_string()
+}
+
+/// One file's contribution to the changeset, reconstructed from the patch.
+struct FileChange {
+    path: String,
+    kind: FileKind,
+    added: usize,
+    removed: usize,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum FileKind {
+    Added,
+    Deleted,
+    Modified,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Category {
+    Source,
+    Test,
+    Docs,
+    Build,
+    Other,
+}
+
+/// A Conventional Commits type.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ChangeType {
+    Feat,
+    Fix,
+    Refactor,
+    Docs,
+    Test,
+    Build,
+    Chore,
+}
+
+impl std::fmt::Display for ChangeType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            ChangeType::Feat => "feat",
+            ChangeType::Fix => "fix",
+            ChangeType::Refactor => "refactor",
+            ChangeType::Docs => "docs",
+            ChangeType::Test => "test",
+            ChangeType::Build => "build",
+            ChangeType::Chore => "chore",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Walk the patch and reconstruct per-file change metadata: whether the
+/// file is new/deleted/modified, and how many lines were added/removed.
+fn parse_file_changes(collected: &analysis::CollectedDiff) -> Vec<FileChange> {
+    let mut changes = Vec::new();
+    let mut current: Option<FileChange> = None;
+
+    let finalize = |current: &mut Option<FileChange>, changes: &mut Vec<FileChange>| {
+        if let Some(c) = current.take() {
+            changes.push(c);
+        }
+    };
+
+    for line in collected.patch.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            finalize(&mut current, &mut changes);
+            let path = rest.split(" b/").last().unwrap_or(rest).to_string();
+            current = Some(FileChange {
+                path,
+                kind: FileKind::Modified,
+                added: 0,
+                removed: 0,
+            });
+        } else if line.starts_with("new file mode") {
+            if let Some(c) = current.as_mut() {
+                c.kind = FileKind::Added;
+            }
+        } else if line.starts_with("deleted file mode") {
+            if let Some(c) = current.as_mut() {
+                c.kind = FileKind::Deleted;
+            }
+        } else if line.starts_with('+') && !line.starts_with("+++") {
+            if let Some(c) = current.as_mut() {
+                c.added += 1;
+            }
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            if let Some(c) = current.as_mut() {
+                c.removed += 1;
+            }
+        }
+    }
+    finalize(&mut current, &mut changes);
+    changes
+}
+
+/// Bucket a path into a coarse category used for type classification.
+fn categorize(path: &str) -> Category {
+    let lower = path.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+
+    if lower.contains("/tests/")
+        || lower.contains("/test/")
+        || lower.contains("__tests__")
+        || name.starts_with("test_")
+        || name.ends_with("_test.rs")
+        || name.ends_with("_test.py")
+        || name.ends_with(".test.ts")
+        || name.ends_with(".test.js")
+        || name.ends_with("_spec.rs")
+        || name.ends_with("_spec.py")
+    {
+        return Category::Test;
+    }
+
+    if name.ends_with(".md")
+        || name.ends_with(".rst")
+        || lower.contains("/docs/")
+        || name.starts_with("readme")
+        || name.starts_with("changelog")
+        || name.starts_with("license")
+    {
+        return Category::Docs;
+    }
+
+    if matches!(
+        name,
+        "cargo.toml"
+            | "cargo.lock"
+            | "package.json"
+            | "package-lock.json"
+            | "yarn.lock"
+            | "pnpm-lock.yaml"
+            | "dockerfile"
+            | "makefile"
+            | "justfile"
+            | "build.rs"
+            | "requirements.txt"
+            | "pyproject.toml"
+            | "setup.py"
+            | "setup.cfg"
+            | "docker-compose.yml"
+            | "composer.json"
+            | "gemfile"
+            | ".gitignore"
+    ) || lower.contains("/.github/")
+        || lower.contains("/.gitlab/")
+        || lower.ends_with(".tf")
+        || lower.ends_with(".toml")
+        || lower.ends_with(".yml")
+        || lower.ends_with(".yaml")
+    {
+        return Category::Build;
+    }
+
+    const SOURCE_EXTS: &[&str] = &[
+        "rs", "py", "js", "ts", "jsx", "tsx", "go", "java", "c", "h", "cpp", "hpp", "cc", "rb",
+        "php", "swift", "kt", "scala", "sh", "sql", "html", "css", "scss", "sass", "vue", "elm",
+        "ex", "exs", "clj", "lua", "dart",
+    ];
+    if let Some(ext) = name.rsplit('.').next() {
+        if SOURCE_EXTS.contains(&ext) {
+            return Category::Source;
+        }
+    }
+
+    Category::Other
+}
+
+/// True for code-bearing files we treat as feature/fix candidates.
+fn is_code_like(category: Category) -> bool {
+    matches!(category, Category::Source | Category::Other)
+}
+
+/// Decide the Conventional Commits type from the whole changeset.
+fn classify_change(changes: &[FileChange]) -> ChangeType {
+    if !changes.is_empty() && changes.iter().all(|c| categorize(&c.path) == Category::Test) {
+        return ChangeType::Test;
+    }
+    if !changes.is_empty() && changes.iter().all(|c| categorize(&c.path) == Category::Docs) {
+        return ChangeType::Docs;
+    }
+    if !changes.is_empty() && changes.iter().all(|c| categorize(&c.path) == Category::Build) {
+        return ChangeType::Build;
+    }
+
+    // New functionality: a newly added code file, *or* a feature that
+    // extends existing files by adding code (pure additions, no removals).
+    // Either way it "falls under feat".
+    let adds_new_code = changes.iter().any(|c| {
+        is_code_like(categorize(&c.path))
+            && matches!(c.kind, FileKind::Added | FileKind::Modified)
+            && c.added > 0
+            && c.removed == 0
+    });
+    if adds_new_code {
+        return ChangeType::Feat;
+    }
+
+    // Otherwise we're editing existing code. A large net deletion across
+    // several files looks like a restructure rather than a targeted fix.
+    let added: usize = changes.iter().map(|c| c.added).sum();
+    let removed: usize = changes.iter().map(|c| c.removed).sum();
+    if changes.len() > 1 && removed > added && removed > 0 {
+        return ChangeType::Refactor;
+    }
+
+    // Edits / deletions of existing code are treated as fixes.
+    if removed > 0 || changes.iter().any(|c| c.kind == FileKind::Deleted) {
+        return ChangeType::Fix;
+    }
+
+    ChangeType::Refactor
+}
+
+/// The imperative subject line, e.g. "add auth" or "update parser and 2
+/// more". Prefers a newly added code file as the primary subject.
+fn subject_line(changes: &[FileChange]) -> String {
+    let primary = changes
+        .iter()
+        .find(|c| c.kind == FileKind::Added && is_code_like(categorize(&c.path)))
+        .or_else(|| changes.iter().find(|c| is_code_like(categorize(&c.path))))
+        .or_else(|| changes.first());
+
+    let Some(primary) = primary else {
+        return "update working changes".to_string();
+    };
+
+    let filename = primary.path.rsplit('/').next().unwrap_or(&primary.path);
+    let stem = filename
+        .rsplit_once('.')
+        .map(|(s, _)| if s.is_empty() { filename } else { s })
+        .unwrap_or(filename);
+
+    let verb = match primary.kind {
+        FileKind::Added => "add",
+        FileKind::Deleted => "remove",
+        FileKind::Modified => "update",
+    };
+
+    let n = changes.len();
+    if n == 1 {
+        format!("{verb} {stem}")
+    } else {
+        format!("{verb} {stem} and {} more", n - 1)
     }
 }
 
@@ -308,6 +724,39 @@ fn slugify(text: &str) -> String {
 fn push_unique(actions: &mut Vec<String>, action: String) {
     if !actions.contains(&action) {
         actions.push(action);
+    }
+}
+
+/// Repair backend group paths that don't match the analyzed diff
+/// verbatim — e.g. the model returned a basename (`analysis.rs`) or a
+/// `./`/`b/` prefix instead of the full path (`crates/cli/src/analysis.rs`).
+/// Falls back to a basename match against the real changed files so a
+/// usable AI split isn't rejected and forced into the offline fallback.
+fn normalize_group_paths(groups: &mut [ChangeGroup], actual: &HashSet<String>) {
+    let resolve = |path: &str| -> String {
+        if actual.contains(path) {
+            return path.to_string();
+        }
+        let cleaned = path
+            .trim_start_matches("./")
+            .trim_start_matches("b/")
+            .trim_start_matches("a/");
+        if actual.contains(cleaned) {
+            return cleaned.to_string();
+        }
+        let base = cleaned.rsplit('/').next().unwrap_or(cleaned);
+        if let Some(found) = actual.iter().find(|f| f.rsplit('/').next() == Some(base)) {
+            return found.clone();
+        }
+        path.to_string()
+    };
+    for group in groups.iter_mut() {
+        for file in group.files.iter_mut() {
+            *file = resolve(file);
+        }
+        for partial in group.partial_files.iter_mut() {
+            partial.path = resolve(&partial.path);
+        }
     }
 }
 
@@ -646,6 +1095,39 @@ enum Choice {
     Cancel,
 }
 
+/// What the user wants to do when the AI analysis or its proposed split
+/// fails: try again, skip straight to the offline plan, or bail out.
+enum RetryDecision {
+    Retry,
+    Offline,
+    Cancel,
+}
+
+/// Offer to retry after a transient failure, fall back to offline, or
+/// cancel. Enter (or `r`) retries; EOF on stdin cancels rather than
+/// looping forever.
+fn prompt_retry(message: &str) -> Result<RetryDecision> {
+    loop {
+        print!("{message}\n[r]etry · [o]ffline fallback · [c]ancel (r): ");
+        io::stdout().flush()?;
+
+        let mut buf = String::new();
+        io::stdin()
+            .read_line(&mut buf)
+            .context("failed to read your input")?;
+        if buf.is_empty() {
+            return Ok(RetryDecision::Cancel);
+        }
+
+        match buf.trim() {
+            "" | "r" | "R" => return Ok(RetryDecision::Retry),
+            "o" | "O" => return Ok(RetryDecision::Offline),
+            "c" | "C" => return Ok(RetryDecision::Cancel),
+            _ => println!("Please answer r, o, or c (Enter = retry)."),
+        }
+    }
+}
+
 /// Read a single-line answer from stdin, trimmed.
 fn prompt_line(question: &str) -> Result<String> {
     print!("{question}");
@@ -897,5 +1379,157 @@ fn read_branch_name(suggestion: &str) -> io::Result<Option<String>> {
 /// cycle/list them shell-style.
 fn branch_candidates(suggestion: &str) -> Vec<String> {
     vec![suggestion.to_string()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn collected(patch: &str, files: &[&str]) -> analysis::CollectedDiff {
+        analysis::CollectedDiff {
+            staged_used: true,
+            files: files.iter().map(|s| s.to_string()).collect(),
+            patch: patch.to_string(),
+            untracked: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn new_source_file_is_feat() {
+        let patch = "diff --git a/src/auth.rs b/src/auth.rs\nnew file mode 100644\n--- /dev/null\n+++ b/src/auth.rs\n@@ -0,0 +1,3 @@\n+fn login() {}\n";
+        let msg = offline_commit_message(&collected(patch, &["src/auth.rs"]));
+        assert!(msg.starts_with("feat("), "got: {msg}");
+        assert!(msg.contains("add auth"), "got: {msg}");
+    }
+
+    #[test]
+    fn modifying_source_is_fix() {
+        let patch = "diff --git a/src/parser.rs b/src/parser.rs\n--- a/src/parser.rs\n+++ b/src/parser.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n";
+        let msg = offline_commit_message(&collected(patch, &["src/parser.rs"]));
+        assert!(msg.starts_with("fix("), "got: {msg}");
+    }
+
+    #[test]
+    fn feature_added_to_existing_file_is_feat() {
+        // Pure additions (no removed lines) extending an existing source
+        // file are a new feature, not a refactor.
+        let patch = "diff --git a/src/foo.rs b/src/foo.rs\n--- a/src/foo.rs\n+++ b/src/foo.rs\n@@ -1 +1,3 @@\n fn existing() {}\n+fn new_feature() {}\n+fn another() {}\n";
+        let msg = offline_commit_message(&collected(patch, &["src/foo.rs"]));
+        assert!(msg.starts_with("feat("), "got: {msg}");
+    }
+
+    #[test]
+    fn only_tests_is_test() {
+        let patch = "diff --git a/tests/auth_test.rs b/tests/auth_test.rs\nnew file mode 100644\n--- /dev/null\n+++ b/tests/auth_test.rs\n@@ -0,0 +1 @@\n+test\n";
+        let msg = offline_commit_message(&collected(patch, &["tests/auth_test.rs"]));
+        assert!(msg.starts_with("test"), "got: {msg}");
+    }
+
+    #[test]
+    fn only_docs_is_docs() {
+        let patch = "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-old\n+new\n";
+        let msg = offline_commit_message(&collected(patch, &["README.md"]));
+        assert!(msg.starts_with("docs"), "got: {msg}");
+    }
+
+    #[test]
+    fn splits_multi_file_fixes_into_separate_commits() {
+        // Two modified files in *different* directories each become their
+        // own `fix` commit (different scope); same-directory fixes group.
+        let patch = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,5 +1,2 @@\n-a\n-b\n-c\n-d\n+e\n\
+                    diff --git a/lib/b.rs b/lib/b.rs\n--- a/lib/b.rs\n+++ b/lib/b.rs\n@@ -1,5 +1,2 @@\n-f\n-g\n-h\n-i\n+j\n";
+        let groups = offline_groups(&collected(&patch, &["src/a.rs", "lib/b.rs"]));
+        assert_eq!(groups.len(), 2, "got: {groups:?}");
+        assert!(groups.iter().all(|g| g.message.starts_with("fix(")));
+    }
+
+    #[test]
+    fn empty_changeset_is_chore() {
+        let msg = offline_commit_message(&collected("", &[]));
+        assert_eq!(msg, "chore: update working changes");
+    }
+
+    #[test]
+    fn scope_strips_source_root() {
+        let patch = "diff --git a/src/auth/login.rs b/src/auth/login.rs\nnew file mode 100644\n--- /dev/null\n+++ b/src/auth/login.rs\n@@ -0,0 +1 @@\n+fn x() {}\n";
+        let msg = offline_commit_message(&collected(patch, &["src/auth/login.rs"]));
+        assert!(msg.starts_with("feat(auth):"), "got: {msg}");
+    }
+
+    #[test]
+    fn crate_layout_scope_is_crate_name_not_src() {
+        // A crate's top-level source file should scope to the crate (`cli`),
+        // not the uninformative `src`.
+        let patch = "diff --git a/crates/cli/src/admin.rs b/crates/cli/src/admin.rs\nnew file mode 100644\n--- /dev/null\n+++ b/crates/cli/src/admin.rs\n@@ -0,0 +1 @@\n+fn grant() {}\n";
+        let msg = offline_commit_message(&collected(patch, &["crates/cli/src/admin.rs"]));
+        assert!(msg.starts_with("feat(cli):"), "got: {msg}");
+
+        // A file deeper in the crate keeps the crate + subdir as scope.
+        let patch2 = "diff --git a/crates/cli/src/auth/login.rs b/crates/cli/src/auth/login.rs\nnew file mode 100644\n--- /dev/null\n+++ b/crates/cli/src/auth/login.rs\n@@ -0,0 +1 @@\n+fn login() {}\n";
+        let msg2 = offline_commit_message(&collected(patch2, &["crates/cli/src/auth/login.rs"]));
+        assert!(msg2.starts_with("feat(cli/auth):"), "got: {msg2}");
+    }
+
+    #[test]
+    fn normalize_repairs_abbreviated_model_paths() {
+        use crate::analysis::{ChangeGroup, PartialFile};
+        let actual: std::collections::HashSet<String> =
+            ["crates/cli/src/analysis.rs", "crates/cli/src/auth/login.rs"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+
+        let mut groups = vec![ChangeGroup {
+            files: vec![
+                "analysis.rs".to_string(),       // basename
+                "./crates/cli/src/auth/login.rs".to_string(), // ./ prefix
+            ],
+            commit_message: "x".into(),
+            rationale: String::new(),
+            partial_files: vec![PartialFile {
+                path: "b/crates/cli/src/analysis.rs".to_string(), // b/ prefix
+                hunks: vec![1],
+            }],
+        }];
+
+        normalize_group_paths(&mut groups, &actual);
+
+        assert_eq!(groups[0].files[0], "crates/cli/src/analysis.rs");
+        assert_eq!(groups[0].files[1], "crates/cli/src/auth/login.rs");
+        assert_eq!(groups[0].partial_files[0].path, "crates/cli/src/analysis.rs");
+    }
+
+    #[test]
+    fn splits_features_fixes_and_remainder_into_separate_commits() {
+        let patch = "\
+diff --git a/src/auth/login.rs b/src/auth/login.rs\nnew file mode 100644\n--- /dev/null\n+++ b/src/auth/login.rs\n@@ -0,0 +1 @@\n+fn login() {}\n\
+diff --git a/src/parser/grammar.rs b/src/parser/grammar.rs\nnew file mode 100644\n--- /dev/null\n+++ b/src/parser/grammar.rs\n@@ -0,0 +1 @@\n+fn parse() {}\n\
+diff --git a/src/cache.rs b/src/cache.rs\n--- a/src/cache.rs\n+++ b/src/cache.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n\
+diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-old\n+new\n";
+        let groups = offline_groups(&collected(
+            patch,
+            &["src/auth/login.rs", "src/parser/grammar.rs", "src/cache.rs", "README.md"],
+        ));
+        // Two distinct features (different scopes) -> 2 feat commits,
+        // one fix, one docs.
+        let types: Vec<&str> = groups.iter().map(|g| g.message.split(':').next().unwrap()).collect();
+        assert_eq!(types.len(), 4, "groups: {groups:?}");
+        assert!(types.iter().filter(|t| t.starts_with("feat")).count() == 2);
+        assert!(types.iter().any(|t| t.starts_with("fix")));
+        assert!(types.iter().any(|t| t.starts_with("docs")));
+    }
+
+    #[test]
+    fn same_scope_features_merge_into_one_commit() {
+        let patch = "\
+diff --git a/src/auth/login.rs b/src/auth/login.rs\nnew file mode 100644\n--- /dev/null\n+++ b/src/auth/login.rs\n@@ -0,0 +1 @@\n+fn login() {}\n\
+diff --git a/src/auth/token.rs b/src/auth/token.rs\nnew file mode 100644\n--- /dev/null\n+++ b/src/auth/token.rs\n@@ -0,0 +1 @@\n+fn token() {}\n";
+        let groups = offline_groups(&collected(
+            patch,
+            &["src/auth/login.rs", "src/auth/token.rs"],
+        ));
+        assert_eq!(groups.len(), 1, "expected one merged feat commit: {groups:?}");
+        assert!(groups[0].message.starts_with("feat(auth):"));
+    }
 }
 

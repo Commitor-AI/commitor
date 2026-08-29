@@ -10,6 +10,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 
 use crate::auth::{self, DASHBOARD_URL};
 use crate::config;
@@ -25,6 +26,50 @@ pub use crate::auth::load_api_key;
 /// `COMMITOR_TIMEOUT_SECS` overrides this for slow setups.
 const ANALYZE_TIMEOUT_SECS: u64 = 180;
 
+/// Where users upgrade their plan — shown when a free-tier diff is too
+/// large to analyze.
+const PRICING_URL: &str = "https://commitor.dev/pricing";
+
+/// Free-tier client cap on diff size. The backend enforces its own
+/// `max_length`; we stop just short of that so a free request never
+/// 422s. Pro users are NOT capped here — the backend enforces the
+/// (higher) per-plan maximum and returns a clear error if exceeded.
+const MAX_PATCH_CHARS: usize = 190_000;
+
+/// Cached plan for the active key (`None` = couldn't verify → treat as
+/// free, the safe default). One key per run, so a `OnceLock` is enough.
+static PLAN_CACHE: OnceLock<Option<String>> = OnceLock::new();
+
+/// True when the active account is on a paid plan. Anything other than
+/// `"free"` (or an empty/missing plan field) counts as paid; a plan we
+/// can't verify is treated as free so oversized diffs stay gated.
+fn is_pro(api_key: &str) -> bool {
+    let plan = PLAN_CACHE
+        .get_or_init(|| crate::auth::plan_for_key(api_key).ok())
+        .clone();
+    match plan {
+        Some(plan) => !plan.eq_ignore_ascii_case("free"),
+        None => false,
+    }
+}
+
+/// Enforce the free-tier diff-size cap. Pro accounts pass through
+/// untouched — the server decides their (higher) limit.
+fn enforce_size_guard(api_key: &str, patch: &str) -> Result<(), AnalyzeError> {
+    if is_pro(api_key) {
+        return Ok(());
+    }
+    if patch.chars().count() > MAX_PATCH_CHARS {
+        return Err(AnalyzeError::Other(anyhow!(
+            "The change is too large for analysis (>{} characters).\n\
+             Large diffs are a Commitor Pro feature — upgrade at {PRICING_URL} to analyze\n\
+             changes this big. Or split the changes into smaller commits manually.",
+            MAX_PATCH_CHARS
+        )));
+    }
+    Ok(())
+}
+
 fn analyze_timeout() -> std::time::Duration {
     let secs = std::env::var("COMMITOR_TIMEOUT_SECS")
         .ok()
@@ -33,11 +78,6 @@ fn analyze_timeout() -> std::time::Duration {
         .unwrap_or(ANALYZE_TIMEOUT_SECS);
     std::time::Duration::from_secs(secs)
 }
-
-/// The backend rejects diffs over 200k characters (`AnalyzeRequest`
-/// `max_length`); stop just short of that so the request never 422s.
-/// Applies to the full patch, including synthesized untracked sections.
-const MAX_PATCH_CHARS: usize = 190_000;
 
 /// How many leading bytes of an untracked file are inspected when
 /// deciding whether it is binary (NUL byte heuristic, same spirit as
@@ -218,12 +258,7 @@ pub fn analyze_with_mode(
     patch: &str,
     mode: &str,
 ) -> Result<(AnalyzeResponse, RateStatus), AnalyzeError> {
-    if patch.chars().count() > MAX_PATCH_CHARS {
-        return Err(AnalyzeError::Other(anyhow!(
-            "The change is too large for analysis (>200k characters).\n\
-             Try scanning a narrower set of changes, or split it manually."
-        )));
-    }
+    enforce_size_guard(api_key, patch)?;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -284,6 +319,14 @@ async fn analyze_request(
             let body = response.text().await.unwrap_or_default();
             Err(AnalyzeError::RateLimited(describe_rate_limit(&body)))
         }
+        413 => {
+            let body = response.text().await.unwrap_or_default();
+            Err(AnalyzeError::Other(anyhow!(
+
+                "{}",
+                describe_diff_too_large(&body)
+            )))
+        }
         _ => {
             let body = response.text().await.unwrap_or_default();
             let snippet: String = body.chars().take(200).collect();
@@ -336,6 +379,28 @@ impl From<anyhow::Error> for AnalyzeError {
 /// Turn a 429 body into a calm, actionable message. The backend sends
 /// `{error, message, limit, reset_at}`; anything else still gets a
 /// decent fallback instead of a raw HTTP error.
+/// Turn a 413 (diff too large) body into a calm, actionable message.
+/// The backend sends `{error, message, limit, upgrade_url}`; anything
+/// else still gets a decent fallback instead of a raw HTTP error.
+fn describe_diff_too_large(body: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(v) => v
+            .get("message")
+            .and_then(|m| m.as_str())
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| {
+                "This change is too large to analyze on your plan. Upgrade at \
+                 https://commitor.dev/pricing for larger diffs."
+                    .to_string()
+            }),
+        Err(_) => {
+            "This change is too large to analyze on your plan. Upgrade at \
+             https://commitor.dev/pricing for larger diffs."
+                .to_string()
+        }
+    }
+}
+
 fn describe_rate_limit(body: &str) -> String {
     let pricing = "https://commitor.dev/pricing";
     match serde_json::from_str::<serde_json::Value>(body) {
