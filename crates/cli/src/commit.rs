@@ -1072,7 +1072,38 @@ fn execute_commits(
         record_session(base_branch, recorded)?;
     }
 
+    // Offer to push the result upstream; never fatal to the commit itself.
+    if let Err(err) = maybe_push() {
+        eprintln!("warning: didn't push — {err:#}");
+    }
+
     Ok(ExitCode::SUCCESS)
+}
+
+/// After a successful commit, ask whether to push the current branch.
+/// Skips the prompt entirely when there is no remote to push to. A push
+/// failure is reported but does not fail the (already successful) commit.
+fn maybe_push() -> Result<()> {
+    if git::upstream().is_none() && !git::remote_exists("origin") {
+        return Ok(());
+    }
+
+    if !prompt_confirm("Push these commits to the remote? [y/N] ")? {
+        return Ok(());
+    }
+
+    println!("Pushing…");
+    git::push_current_branch()
+}
+
+/// Prompt for a yes/no answer; only `y`/`yes` (case-insensitive) returns
+/// true, and the default (empty input) is No.
+fn prompt_confirm(question: &str) -> Result<bool> {
+    print!("{question}");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
 /// Persist a successful `commitor commit` run to the per-repo session

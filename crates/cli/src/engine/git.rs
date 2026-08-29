@@ -303,6 +303,40 @@ pub fn parent_of(sha: &str) -> Result<String> {
     run_git(&["rev-parse", &arg]).map(|s| s.trim().to_string())
 }
 
+/// Name of the current branch's upstream tracking ref (e.g. `origin/main`),
+/// or `None` when the branch has no upstream configured.
+pub fn upstream() -> Option<String> {
+    let out = run_git(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]).ok()?;
+    let name = out.trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// True when a remote with the given name is configured.
+pub fn remote_exists(name: &str) -> bool {
+    Command::new("git")
+        .args(["remote", "get-url", name])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// Push the current branch to its remote. Uses the configured upstream when
+/// one exists; otherwise pushes `-u origin <branch>` to set one up. Fails
+/// clearly on a detached HEAD or when there is no `origin` remote.
+pub fn push_current_branch() -> Result<()> {
+    if upstream().is_some() {
+        run_git(&["push"]).map(drop)
+    } else {
+        let branch = current_branch()?
+            .context("cannot push: HEAD is detached, so there is no branch to push")?;
+        run_git(&["push", "-u", "origin", &branch]).map(drop)
+    }
+}
+
 fn run_git(args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .args(args)
