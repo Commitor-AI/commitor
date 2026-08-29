@@ -11,6 +11,7 @@ mod commit;
 mod config;
 mod engine;
 mod heuristics;
+mod revert;
 mod scan;
 
 use engine::update;
@@ -67,6 +68,22 @@ enum Commands {
         /// accept, or type your own; Ctrl-C to skip)
         #[arg(short = 'b')]
         branch: bool,
+    },
+    /// Undo commits made by a previous `commitor commit` run
+    Revert {
+        /// Show the last N sessions instead of reverting the most recent
+        #[arg(long)]
+        list: bool,
+        /// Skip the working-tree-dirty safety check (use with care — a
+        /// reset can discard uncommitted work)
+        #[arg(long)]
+        force: bool,
+        /// Target a specific session by id (or any commit sha it contains)
+        #[arg(value_name = "SESSION_ID")]
+        session: Option<String>,
+        /// Number of sessions to show with --list (default 10)
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// Update commitor to the latest release
     Update,
@@ -147,6 +164,18 @@ fn execute(command: Commands) -> Result<ExitCode, Option<anyhow::Error>> {
         Commands::Commit { all, offline, branch } => {
             commit::run(commit::CommitFlags { all, offline, branch }).map_err(Some)
         }
+        Commands::Revert {
+            list,
+            force,
+            session,
+            limit,
+        } => revert::run(revert::RevertFlags {
+            list,
+            force,
+            session,
+            limit,
+        })
+        .map_err(Some),
         Commands::Update => run_update().map(|_| ExitCode::SUCCESS).map_err(Some),
         Commands::Admin { action } => match action.as_str() {
             "status" => admin::status().map(|_| ExitCode::SUCCESS).map_err(Some),
