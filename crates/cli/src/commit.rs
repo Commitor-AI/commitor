@@ -61,6 +61,10 @@ pub fn run(flags: CommitFlags) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    // Captured before any `-b` branch switch so we can record what the new
+    // branch was forked from in the session log.
+    let starting_branch = git::current_branch()?;
+
     // ── 0. Branch selection (optional) ─────────────────────────────
     // Switch to the chosen branch up front so every resulting commit
     // lands there. A name is suggested from the diff; uncommitted
@@ -95,6 +99,14 @@ pub fn run(flags: CommitFlags) -> Result<ExitCode> {
         }
     }
 
+    // The branch the commits will land on is the current one; if `-b` was
+    // used, the branch we forked from is what we record as `base_branch`.
+    let base_branch = if flags.branch {
+        starting_branch
+    } else {
+        None
+    };
+
     println!(
         "Analyzing {} changed file(s) ({})…",
         collected.files.len(),
@@ -108,7 +120,7 @@ pub fn run(flags: CommitFlags) -> Result<ExitCode> {
     // Explicit --offline: no account, no backend, no quota needed.
     if flags.offline {
         println!("Offline mode — building a basic local plan (no AI).");
-        return commit_offline(&collected, &baseline);
+        return commit_offline(&collected, &baseline, base_branch.as_deref());
     }
 
     // ── 2. Auth + local hint ────────────────────────────────────────
@@ -137,13 +149,13 @@ pub fn run(flags: CommitFlags) -> Result<ExitCode> {
                         println!();
                         println!("AI analysis still unavailable after {attempts} tries — {reason}");
                         println!("Falling back to an offline plan; rerun later for an AI-crafted message.");
-                        return commit_offline(&collected, &baseline);
+                        return commit_offline(&collected, &baseline, base_branch.as_deref());
                     }
                     match prompt_retry(&format!("AI analysis unavailable — {reason}"))? {
                         RetryDecision::Retry => continue,
                         RetryDecision::Offline => {
                             println!("Falling back to an offline plan.");
-                            return commit_offline(&collected, &baseline);
+                            return commit_offline(&collected, &baseline, base_branch.as_deref());
                         }
                         RetryDecision::Cancel => {
                             println!("Commit cancelled, nothing was changed.");
@@ -186,7 +198,7 @@ pub fn run(flags: CommitFlags) -> Result<ExitCode> {
                      Re-run later (or use `commitor commit --offline`) for an AI split."
                 );
                 let plan = offline_groups(&collected);
-                return run_offline_plan(plan, &file_diffs, collected.staged_used, &baseline);
+                return run_offline_plan(plan, &file_diffs, collected.staged_used, &baseline, base_branch.as_deref());
             }
             match prompt_retry(&format!(
                 "The suggested split was inconsistent ({err}). Retry for a fresh split?"
@@ -203,14 +215,14 @@ pub fn run(flags: CommitFlags) -> Result<ExitCode> {
                         | Err(analysis::AnalyzeError::Unavailable(reason)) => {
                             println!("AI unavailable ({reason}) — falling back to an offline plan.");
                             let plan = offline_groups(&collected);
-                            return run_offline_plan(plan, &file_diffs, collected.staged_used, &baseline);
+                            return run_offline_plan(plan, &file_diffs, collected.staged_used, &baseline, base_branch.as_deref());
                         }
                         Err(err) => return Err(err.into()),
                     }
                 }
                 RetryDecision::Offline => {
                     let plan = offline_groups(&collected);
-                    return run_offline_plan(plan, &file_diffs, collected.staged_used, &baseline);
+                    return run_offline_plan(plan, &file_diffs, collected.staged_used, &baseline, base_branch.as_deref());
                 }
                 RetryDecision::Cancel => {
                     println!("Commit cancelled, nothing was changed.");
@@ -220,7 +232,7 @@ pub fn run(flags: CommitFlags) -> Result<ExitCode> {
         }
 
         let code = if response.groups.len() <= 1 {
-            commit_single(&mut plan, &file_diffs, collected.staged_used, &baseline)?
+            commit_single(&mut plan, &file_diffs, collected.staged_used, &baseline, base_branch.as_deref())?
         } else {
             commit_split(
                 &response.groups,
@@ -229,6 +241,7 @@ pub fn run(flags: CommitFlags) -> Result<ExitCode> {
                 &file_diffs,
                 collected.staged_used,
                 &baseline,
+                base_branch.as_deref(),
             )?
         };
 
@@ -251,11 +264,15 @@ pub fn run(flags: CommitFlags) -> Result<ExitCode> {
 /// unavailable (quota exhausted, backend down). It splits the diff into
 /// one commit per `(type, scope)` (features, fixes, and the remainder in
 /// their own commits) using only local heuristics.
-fn commit_offline(collected: &analysis::CollectedDiff, baseline: &str) -> Result<ExitCode> {
+fn commit_offline(
+    collected: &analysis::CollectedDiff,
+    baseline: &str,
+    base_branch: Option<&str>,
+) -> Result<ExitCode> {
     ensure_tree_unchanged(baseline)?;
     let file_diffs = hunks::parse(&collected.patch);
     let plan = offline_groups(collected);
-    run_offline_plan(plan, &file_diffs, collected.staged_used, baseline)
+    run_offline_plan(plan, &file_diffs, collected.staged_used, baseline, base_branch)
 }
 
 /// Validate an offline-derived plan and execute it, committing each
@@ -265,6 +282,7 @@ fn run_offline_plan(
     file_diffs: &[FileDiff],
     staged_used: bool,
     baseline: &str,
+    base_branch: Option<&str>,
 ) -> Result<ExitCode> {
     if let Err(err) = hunks::validate(file_diffs, &plan, &plan_files(&plan)) {
         bail!(
@@ -273,9 +291,9 @@ fn run_offline_plan(
         );
     }
     if plan.len() <= 1 {
-        commit_single(&mut plan, file_diffs, staged_used, baseline)
+        commit_single(&mut plan, file_diffs, staged_used, baseline, base_branch)
     } else {
-        commit_split(&[], None, &mut plan, file_diffs, staged_used, baseline)
+        commit_split(&[], None, &mut plan, file_diffs, staged_used, baseline, base_branch)
     }
 }
 
@@ -798,6 +816,7 @@ fn commit_single(
     file_diffs: &[FileDiff],
     staged_used: bool,
     baseline: &str,
+    base_branch: Option<&str>,
 ) -> Result<ExitCode> {
     let Some(group) = plan.first_mut() else {
         bail!(
@@ -839,7 +858,7 @@ fn commit_single(
         }
     }
 
-    execute_commits(plan, file_diffs, staged_used, baseline)
+    execute_commits(plan, file_diffs, staged_used, baseline, base_branch)
 }
 
 /// Multiple groups → show the proposed split and commit each group in
@@ -851,6 +870,7 @@ fn commit_split(
     file_diffs: &[FileDiff],
     staged_used: bool,
     baseline: &str,
+    base_branch: Option<&str>,
 ) -> Result<ExitCode> {
     println!();
     println!(
@@ -901,7 +921,7 @@ fn commit_split(
         }
     }
 
-    execute_commits(plan, file_diffs, staged_used, baseline)
+    execute_commits(plan, file_diffs, staged_used, baseline, base_branch)
 }
 
 /// One line listing a group's contents: whole paths plain, partial
@@ -956,6 +976,7 @@ fn execute_commits(
     file_diffs: &[FileDiff],
     staged_used: bool,
     baseline: &str,
+    base_branch: Option<&str>,
 ) -> Result<ExitCode> {
     // Final sanity check immediately before mutating anything.
     ensure_tree_unchanged(baseline)?;
@@ -985,6 +1006,8 @@ fn execute_commits(
 
     let total = plan.len();
     let mut committed: Vec<String> = Vec::new();
+    // What we'll record to the session log once every commit lands.
+    let mut recorded: Vec<crate::engine::history::SessionCommit> = Vec::new();
 
     for (index, group) in plan.iter().enumerate() {
         let number = index + 1;
@@ -1018,6 +1041,20 @@ fn execute_commits(
                     }
                 }
                 committed.push(group.message.clone());
+
+                // Capture the commit we just made for the session log.
+                let sha = git::head_sha()?;
+                let mut files: Vec<String> = group.whole.clone();
+                for (path, _) in &group.partial {
+                    if !files.contains(path) {
+                        files.push(path.clone());
+                    }
+                }
+                recorded.push(crate::engine::history::SessionCommit {
+                    sha,
+                    message: group.message.clone(),
+                    files,
+                });
             }
             Err(err) => {
                 eprintln!("error: {err:#}");
@@ -1028,7 +1065,43 @@ fn execute_commits(
 
     println!();
     println!("Done — created {total} commit(s).");
+
+    // Record the session only after every commit succeeded, so a partial
+    // failure never leaves a half-populated entry in the history log.
+    if !recorded.is_empty() {
+        record_session(base_branch, recorded)?;
+    }
+
     Ok(ExitCode::SUCCESS)
+}
+
+/// Persist a successful `commitor commit` run to the per-repo session
+/// log. All errors here are non-fatal to the commit itself (the user
+/// already has their commits) but are surfaced so a broken history dir
+/// doesn't fail silently.
+fn record_session(
+    base_branch: Option<&str>,
+    commits: Vec<crate::engine::history::SessionCommit>,
+) -> Result<()> {
+    use crate::engine::history;
+
+    let first_sha = match commits.first() {
+        Some(c) => c.sha.clone(),
+        None => return Ok(()),
+    };
+    let branch = git::current_branch()?;
+    let session = history::Session {
+        session_id: history::new_session_id(&first_sha),
+        timestamp: history::now_iso(),
+        branch,
+        base_branch: base_branch.map(str::to_string),
+        commits,
+        pushed: false,
+        reverted: false,
+        reverted_at: None,
+    };
+    history::record_session(&session)?;
+    Ok(())
 }
 
 /// True when any status entry has a non-space INDEX column (X), i.e.
