@@ -46,10 +46,34 @@ jobs:
         env:
           TAG: ${{ steps.tag.outputs.value }}
 
+      - name: Skip if version already on crates.io
+        id: crates_io
+        env:
+          TAG: ${{ steps.tag.outputs.value }}
+        run: |
+          tag="${TAG#v}"
+          status=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "User-Agent: commitor-cli-publish" \
+            "https://crates.io/api/v1/crates/commitor-cli/$tag")
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
       - name: Publish commitor-cli
+        if: steps.crates_io.outputs.status != '200'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p commitor-cli
+        run: |
+          set +e
+          out=$(cargo publish -p commitor-cli 2>&1)
+          rc=$?
+          echo "$out"
+          # Tolerate a version that slipped through (e.g. a prior partial
+          # run already published it) so the workflow doesn't fail on a
+          # re-run of the same release.
+          if echo "$out" | grep -qi "already uploaded"; then
+            echo "Version already published — treating as success."
+            exit 0
+          fi
+          exit $rc
 
   npm:
     name: Publish to npm
@@ -83,9 +107,32 @@ jobs:
         env:
           TAG: ${{ steps.tag.outputs.value }}
 
+      - name: Skip if version already on npm
+        id: npm_check
+        env:
+          TAG: ${{ steps.tag.outputs.value }}
+        run: |
+          tag="${TAG#v}"
+          if npm view "commitor-cli@$tag" version >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Configure npm auth
+        if: steps.npm_check.outputs.published != 'true'
         run: echo "//registry.npmjs.org/:_authToken=${{ secrets.NPM_TOKEN }}" > npm/.npmrc
 
       - name: Publish commitor-cli
-        run: npm publish --access public
+        if: steps.npm_check.outputs.published != 'true'
+        run: |
+          set +e
+          out=$(npm publish --access public 2>&1)
+          rc=$?
+          echo "$out"
+          if echo "$out" | grep -qi "previously published\|cannot publish over"; then
+            echo "Version already published — treating as success."
+            exit 0
+          fi
+          exit $rc
         working-directory: npm
