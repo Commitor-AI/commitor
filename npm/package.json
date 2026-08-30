@@ -1,6 +1,6 @@
 {
   "name": "commitor-cli",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Catches unrelated changes bundled into commits and splits them cleanly — whole-file or hunk-level, guided by AI analysis",
   "bin": {
     "commitor": "bin/commitor.js"

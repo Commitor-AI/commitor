@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project is in 0.x, minor versions may add, change, or remove
 functionality freely; 1.0.0 marks a stable command surface.
 
+## [0.5.1] — 2026-08-30
+
+### Fixed
+- Running `commitor scan` outside a git repository now stops with a clear
+  "not a git repository" message instead of git's raw diff usage dump.
+
 ## [0.5.0] — 2026-08-29
 
 ### Added
@@ -188,6 +194,7 @@ not of the full tool.
 - `commitor scan` and `commitor commit` — in active development,
   coming in future 0.x releases.
 
+[0.5.1]: https://github.com/Commitor-AI/commitor/releases/tag/v0.5.1
 [0.5.0]: https://github.com/Commitor-AI/commitor/releases/tag/v0.5.0
 [0.4.0]: https://github.com/Commitor-AI/commitor/releases/tag/v0.4.0
 [0.3.3]: https://github.com/Commitor-AI/commitor/releases/tag/v0.3.3

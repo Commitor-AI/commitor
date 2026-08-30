@@ -33,6 +33,17 @@ pub fn get_branch_diff(base: &str) -> Result<String> {
     run_git(&["diff", &format!("{base}...HEAD")])
 }
 
+/// True when the current directory is inside a git work tree (bare
+/// repos and `.git` directories report `false`). Checks `rev-parse
+/// --is-inside-work-tree` because `git diff` outside a repo falls into
+/// `--no-index` mode and prints an unrelated usage dump instead of the
+/// usual "not a git repository" error.
+pub fn is_work_tree() -> bool {
+    run_git(&["rev-parse", "--is-inside-work-tree"])
+        .map(|out| out.trim() == "true")
+        .unwrap_or(false)
+}
+
 /// The full patch text of one diff flavor: staged when `staged`,
 /// unstaged (working tree) otherwise.
 pub fn diff_patch(staged: bool) -> Result<String> {
