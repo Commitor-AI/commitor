@@ -17,6 +17,7 @@ use std::process::ExitCode;
 use anyhow::{bail, Result};
 
 use crate::analysis;
+use crate::engine::git;
 use crate::heuristics::{self, Verdict};
 
 #[derive(Debug, Default)]
@@ -46,6 +47,10 @@ fn scan_escalates(verdict: &Verdict, diff_range: bool) -> bool {
 }
 
 pub fn run(flags: ScanFlags) -> Result<ExitCode> {
+    if !git::is_work_tree() {
+        bail!("this doesn't look like a git repository — run `commitor scan` from inside a git repository");
+    }
+
     // Machine-readable output modes suppress the human progress lines.
     let quiet = flags.json || flags.markdown;
 
