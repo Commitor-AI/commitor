@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 mod admin;
 mod analysis;
 mod auth;
+mod changelog;
 mod commit;
 mod config;
 mod engine;
@@ -95,6 +96,21 @@ enum Commands {
         /// Number of sessions to show with --list (default 10)
         #[arg(long)]
         limit: Option<usize>,
+    },
+    /// Generate a Conventional Commit changelog from git history
+    Changelog {
+        /// Revision range to analyze (e.g. `v0.1.0..HEAD` or `origin/main..HEAD`)
+        #[arg(long, value_name = "RANGE")]
+        range: Option<String>,
+        /// Number of commits to analyze if no range is specified (default: 20)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Emit GitHub-flavored Markdown suited to CHANGELOG.md
+        #[arg(long)]
+        markdown: bool,
+        /// Print machine-readable JSON output
+        #[arg(long)]
+        json: bool,
     },
     /// Update commitor to the latest release
     Update,
@@ -191,6 +207,18 @@ fn execute(command: Commands) -> Result<ExitCode, Option<anyhow::Error>> {
             force,
             session,
             limit,
+        })
+        .map_err(Some),
+        Commands::Changelog {
+            range,
+            limit,
+            markdown,
+            json,
+        } => changelog::run(changelog::ChangelogFlags {
+            range,
+            limit,
+            markdown,
+            json,
         })
         .map_err(Some),
         Commands::Update => run_update().map(|_| ExitCode::SUCCESS).map_err(Some),
