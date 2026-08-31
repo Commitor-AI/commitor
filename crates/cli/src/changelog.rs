@@ -1,6 +1,5 @@
 //! `commitor changelog` — generate Conventional Commit changelogs from git history.
 
-use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::process::{Command, ExitCode};
 
@@ -8,6 +7,23 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::engine::git;
+
+const KNOWN_TYPES: &[&str] = &[
+    "feat", "fix", "docs", "style", "refactor", "perf", "test", "chore", "ci", "build",
+];
+
+const CATEGORY_ORDER: &[(&str, &str)] = &[
+    ("feat", "Features"),
+    ("fix", "Bug Fixes"),
+    ("perf", "Performance Improvements"),
+    ("refactor", "Refactoring"),
+    ("docs", "Documentation"),
+    ("build", "Build System"),
+    ("ci", "Continuous Integration"),
+    ("test", "Tests"),
+    ("style", "Styles"),
+    ("chore", "Chores & Maintenance"),
+];
 
 #[derive(Debug, Default)]
 pub struct ChangelogFlags {
@@ -19,6 +35,8 @@ pub struct ChangelogFlags {
     pub markdown: bool,
     /// Print machine-readable JSON output
     pub json: bool,
+    /// Include chore commits whose summary starts with "release v"
+    pub include_release_chores: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -35,8 +53,10 @@ pub struct CommitEntry {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ChangelogReport {
     pub range: String,
-    pub total_commits: usize,
-    pub categories: BTreeMap<String, Vec<CommitEntry>>,
+    pub total_scanned: usize,
+    pub conventional_count: usize,
+    pub excluded_release_chores: usize,
+    pub categories: Vec<(String, Vec<CommitEntry>)>,
     pub breaking_changes: Vec<CommitEntry>,
 }
 
@@ -46,6 +66,7 @@ pub fn run(flags: ChangelogFlags) -> Result<ExitCode> {
     }
 
     let commits = fetch_commits(flags.range.as_deref(), flags.limit)?;
+    let total_scanned = commits.len();
 
     if commits.is_empty() {
         if flags.markdown {
@@ -56,8 +77,10 @@ pub fn run(flags: ChangelogFlags) -> Result<ExitCode> {
         } else if flags.json {
             let empty_report = ChangelogReport {
                 range: flags.range.unwrap_or_else(|| "HEAD".into()),
-                total_commits: 0,
-                categories: BTreeMap::new(),
+                total_scanned: 0,
+                conventional_count: 0,
+                excluded_release_chores: 0,
+                categories: Vec::new(),
                 breaking_changes: Vec::new(),
             };
             println!("{}", serde_json::to_string_pretty(&empty_report)?);
@@ -67,40 +90,57 @@ pub fn run(flags: ChangelogFlags) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let mut categories: BTreeMap<String, Vec<CommitEntry>> = BTreeMap::new();
-    let mut breaking_changes: Vec<CommitEntry> = Vec::new();
+    let mut conventional: Vec<CommitEntry> = Vec::new();
+    let mut excluded_release_chores: usize = 0;
 
-    for commit in &commits {
+    for commit in commits {
+        if commit.commit_type == "chore"
+            && commit
+                .summary
+                .to_lowercase()
+                .starts_with("release v")
+            && !flags.include_release_chores
+        {
+            excluded_release_chores += 1;
+            continue;
+        }
+        conventional.push(commit);
+    }
+
+    let conventional_count = conventional.len();
+
+    let mut breaking_changes: Vec<CommitEntry> = Vec::new();
+    let mut buckets: Vec<(String, Vec<CommitEntry>)> = CATEGORY_ORDER
+        .iter()
+        .map(|(_, label)| (label.to_string(), Vec::new()))
+        .collect();
+
+    for commit in &conventional {
         if commit.is_breaking {
             breaking_changes.push(commit.clone());
         }
 
-        let cat_name = match commit.commit_type.as_str() {
-            "feat" => "Features",
-            "fix" => "Bug Fixes",
-            "docs" => "Documentation",
-            "refactor" => "Refactoring",
-            "perf" => "Performance Improvements",
-            "test" => "Tests",
-            "style" => "Styles",
-            "chore" => "Chores & Maintenance",
-            "ci" => "Continuous Integration",
-            "build" => "Build System",
-            _ => "Other Changes",
-        };
-
-        categories
-            .entry(cat_name.to_string())
-            .or_default()
-            .push(commit.clone());
+        if let Some(pos) = CATEGORY_ORDER
+            .iter()
+            .position(|(ty, _)| *ty == commit.commit_type.as_str())
+        {
+            buckets[pos].1.push(commit.clone());
+        }
     }
+
+    let categories: Vec<(String, Vec<CommitEntry>)> = buckets
+        .into_iter()
+        .filter(|(_, entries)| !entries.is_empty())
+        .collect();
 
     let report = ChangelogReport {
         range: flags
             .range
             .clone()
-            .unwrap_or_else(|| format!("Last {} commits", commits.len())),
-        total_commits: commits.len(),
+            .unwrap_or_else(|| format!("Last {total_scanned} commits")),
+        total_scanned,
+        conventional_count,
+        excluded_release_chores,
         categories,
         breaking_changes,
     };
@@ -118,7 +158,7 @@ pub fn run(flags: ChangelogFlags) -> Result<ExitCode> {
 
 fn fetch_commits(range: Option<&str>, limit: Option<usize>) -> Result<Vec<CommitEntry>> {
     let mut args = vec!["log", "--pretty=format:%h|%an|%ad|%s", "--date=short"];
-    
+
     let limit_str;
     if let Some(r) = range {
         args.push(r);
@@ -193,6 +233,10 @@ pub fn parse_conventional(
         return None;
     }
 
+    if !KNOWN_TYPES.contains(&commit_type.as_str()) {
+        return None;
+    }
+
     Some(CommitEntry {
         hash,
         commit_type,
@@ -233,11 +277,14 @@ fn yellow(text: &str) -> String {
 }
 
 fn render_terminal(report: &ChangelogReport) {
-    println!("{}", bold(&format!("📋 Commitor Changelog ({})", report.range)));
-    println!("Total Conventional Commits: {}\n", report.total_commits);
+    println!("{}", bold(&format!("Commitor Changelog ({})", report.range)));
+    println!(
+        "Scanned {} commits \u{00b7} {} conventional \u{00b7} {} release chores excluded\n",
+        report.total_scanned, report.conventional_count, report.excluded_release_chores
+    );
 
     if !report.breaking_changes.is_empty() {
-        println!("{}", yellow("🚨 BREAKING CHANGES:"));
+        println!("{}", yellow("BREAKING CHANGES:"));
         for entry in &report.breaking_changes {
             let scope_str = entry
                 .scope
@@ -245,7 +292,7 @@ fn render_terminal(report: &ChangelogReport) {
                 .map(|s| format!("({s})"))
                 .unwrap_or_default();
             println!(
-                "  • {}{}: {} [{}]",
+                "  \u{2022} {}{}: {} [{}]",
                 entry.commit_type, scope_str, entry.summary, entry.hash
             );
         }
@@ -261,7 +308,7 @@ fn render_terminal(report: &ChangelogReport) {
                 .map(|s| format!("({s})"))
                 .unwrap_or_default();
             println!(
-                "  • {}{}: {} ({})",
+                "  \u{2022} {}{}: {} ({})",
                 entry.commit_type, scope_str, entry.summary, entry.hash
             );
         }
@@ -271,9 +318,13 @@ fn render_terminal(report: &ChangelogReport) {
 
 fn render_markdown(report: &ChangelogReport) {
     println!("# Changelog ({})\n", report.range);
+    println!(
+        "_Scanned {} commits \u{00b7} {} conventional \u{00b7} {} release chores excluded_\n",
+        report.total_scanned, report.conventional_count, report.excluded_release_chores
+    );
 
     if !report.breaking_changes.is_empty() {
-        println!("## 🚨 BREAKING CHANGES\n");
+        println!("## BREAKING CHANGES\n");
         for entry in &report.breaking_changes {
             let scope_str = entry
                 .scope
@@ -364,5 +415,153 @@ mod tests {
         );
 
         assert!(entry.is_none());
+    }
+
+    #[test]
+    fn rejects_unknown_commit_type() {
+        let entry = parse_conventional(
+            "aaa1111".into(),
+            "Eve".into(),
+            "2026-08-30".into(),
+            "modernize cli auth: add tokio-macros",
+        );
+
+        assert!(entry.is_none());
+    }
+
+    #[test]
+    fn release_chore_is_excluded_by_default() {
+        let flags = ChangelogFlags {
+            include_release_chores: false,
+            ..Default::default()
+        };
+
+        let entry = CommitEntry {
+            hash: "aaa2222".into(),
+            commit_type: "chore".into(),
+            scope: None,
+            summary: "release v1.2.0".into(),
+            is_breaking: false,
+            author: "Alice".into(),
+            date: "2026-08-30".into(),
+        };
+
+        let commits = vec![entry];
+        let mut conventional: Vec<CommitEntry> = Vec::new();
+        let mut excluded = 0usize;
+
+        for commit in commits {
+            if commit.commit_type == "chore"
+                && commit
+                    .summary
+                    .to_lowercase()
+                    .starts_with("release v")
+                && !flags.include_release_chores
+            {
+                excluded += 1;
+                continue;
+            }
+            conventional.push(commit);
+        }
+
+        assert_eq!(excluded, 1);
+        assert!(conventional.is_empty());
+    }
+
+    #[test]
+    fn release_chore_included_when_flag_set() {
+        let flags = ChangelogFlags {
+            include_release_chores: true,
+            ..Default::default()
+        };
+
+        let entry = CommitEntry {
+            hash: "aaa3333".into(),
+            commit_type: "chore".into(),
+            scope: None,
+            summary: "release v1.2.0".into(),
+            is_breaking: false,
+            author: "Alice".into(),
+            date: "2026-08-30".into(),
+        };
+
+        let commits = vec![entry];
+        let mut conventional: Vec<CommitEntry> = Vec::new();
+        let mut excluded = 0usize;
+
+        for commit in commits {
+            if commit.commit_type == "chore"
+                && commit
+                    .summary
+                    .to_lowercase()
+                    .starts_with("release v")
+                && !flags.include_release_chores
+            {
+                excluded += 1;
+                continue;
+            }
+            conventional.push(commit);
+        }
+
+        assert_eq!(excluded, 0);
+        assert_eq!(conventional.len(), 1);
+    }
+
+    #[test]
+    fn categories_follow_fixed_order() {
+        let entries: Vec<CommitEntry> = vec![
+            CommitEntry {
+                hash: "c1".into(),
+                commit_type: "chore".into(),
+                scope: None,
+                summary: "clean up".into(),
+                is_breaking: false,
+                author: "A".into(),
+                date: "2026-08-30".into(),
+            },
+            CommitEntry {
+                hash: "c2".into(),
+                commit_type: "feat".into(),
+                scope: None,
+                summary: "add widget".into(),
+                is_breaking: false,
+                author: "A".into(),
+                date: "2026-08-30".into(),
+            },
+            CommitEntry {
+                hash: "c3".into(),
+                commit_type: "fix".into(),
+                scope: None,
+                summary: "patch bug".into(),
+                is_breaking: false,
+                author: "A".into(),
+                date: "2026-08-30".into(),
+            },
+        ];
+
+        let mut buckets: Vec<(String, Vec<CommitEntry>)> = CATEGORY_ORDER
+            .iter()
+            .map(|(_, label)| (label.to_string(), Vec::new()))
+            .collect();
+
+        for commit in &entries {
+            if let Some(pos) = CATEGORY_ORDER
+                .iter()
+                .position(|(ty, _)| *ty == commit.commit_type.as_str())
+            {
+                buckets[pos].1.push(commit.clone());
+            }
+        }
+
+        let categories: Vec<(String, Vec<CommitEntry>)> = buckets
+            .into_iter()
+            .filter(|(_, entries)| !entries.is_empty())
+            .collect();
+
+        let labels: Vec<&str> = categories.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["Features", "Bug Fixes", "Chores & Maintenance"]
+        );
     }
 }

@@ -111,6 +111,9 @@ enum Commands {
         /// Print machine-readable JSON output
         #[arg(long)]
         json: bool,
+        /// Include chore commits whose summary starts with "release v"
+        #[arg(long)]
+        include_release_chores: bool,
     },
     /// Update commitor to the latest release
     Update,
@@ -214,11 +217,13 @@ fn execute(command: Commands) -> Result<ExitCode, Option<anyhow::Error>> {
             limit,
             markdown,
             json,
+            include_release_chores,
         } => changelog::run(changelog::ChangelogFlags {
             range,
             limit,
             markdown,
             json,
+            include_release_chores,
         })
         .map_err(Some),
         Commands::Update => run_update().map(|_| ExitCode::SUCCESS).map_err(Some),
