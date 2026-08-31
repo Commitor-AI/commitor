@@ -6,6 +6,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project is in 0.x, minor versions may add, change, or remove
 functionality freely; 1.0.0 marks a stable command surface.
 
+## [0.6.0] — 2026-08-31
+
+### Added
+
+- `commitor changelog` — generate a Conventional Commit changelog from git
+  history, with:
+  - **strict type validation** — only the standard Conventional Commit types
+    (feat, fix, docs, style, refactor, perf, test, chore, ci, build, revert)
+    are accepted; non-conventional commits are excluded rather than shoved into
+    a catch-all bucket,
+  - **fixed category ordering** (Features, Bug Fixes, Reverts, …) instead of
+    alphabetical,
+  - **release-chore filtering** — `chore` commits bumping a version
+    (`release v…`) are excluded by default; `--include-release-chores` keeps
+    them, and the header reports how many were excluded,
+  - **accurate header counts** — `Scanned N commits · N conventional · N
+    release chores excluded` instead of a misleading total,
+  - **full-message support** — BREAKING CHANGE is detected in the commit body
+    (the spec's canonical location), not just the subject,
+  - **default range "since last tag"** — falls back to `git describe` for
+    `{last-tag}..HEAD` when no explicit `--range` is given,
+  - **`--scope <name>`** — keep only commits whose scope matches
+    (case-insensitive),
+  - **`--output <path>`** — write/update a CHANGELOG.md at the
+    `<!-- commitor:changelog -->` marker, prepending newer entries above older
+    ones,
+  - **revert detection** — git's default `Revert "…"` messages (and
+    conventional `revert:`) get their own "Reverts" section.
+
+### Changed
+
+- `commitor changelog` output and JSON report shape reflect the new scanning
+  counts and fixed ordering.
+
 ## [0.5.1] — 2026-08-30
 
 ### Fixed
@@ -194,6 +228,7 @@ not of the full tool.
 - `commitor scan` and `commitor commit` — in active development,
   coming in future 0.x releases.
 
+[0.6.0]: https://github.com/Commitor-AI/commitor/releases/tag/v0.6.0
 [0.5.1]: https://github.com/Commitor-AI/commitor/releases/tag/v0.5.1
 [0.5.0]: https://github.com/Commitor-AI/commitor/releases/tag/v0.5.0
 [0.4.0]: https://github.com/Commitor-AI/commitor/releases/tag/v0.4.0
