@@ -114,6 +114,12 @@ enum Commands {
         /// Include chore commits whose summary starts with "release v"
         #[arg(long)]
         include_release_chores: bool,
+        /// Only include commits whose scope matches (case-insensitive)
+        #[arg(long, value_name = "NAME")]
+        scope: Option<String>,
+        /// Write the changelog to this file instead of stdout
+        #[arg(long, value_name = "PATH")]
+        output: Option<String>,
     },
     /// Update commitor to the latest release
     Update,
@@ -218,12 +224,16 @@ fn execute(command: Commands) -> Result<ExitCode, Option<anyhow::Error>> {
             markdown,
             json,
             include_release_chores,
+            scope,
+            output,
         } => changelog::run(changelog::ChangelogFlags {
             range,
             limit,
             markdown,
             json,
             include_release_chores,
+            scope_filter: scope,
+            output: output.map(std::path::PathBuf::from),
         })
         .map_err(Some),
         Commands::Update => run_update().map(|_| ExitCode::SUCCESS).map_err(Some),
