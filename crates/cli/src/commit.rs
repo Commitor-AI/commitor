@@ -193,9 +193,9 @@ pub fn run(flags: CommitFlags) -> Result<ExitCode> {
             if plan_attempt >= MAX_PLAN_ATTEMPTS {
                 println!();
                 println!(
-                    "note: the suggested split was still inconsistent ({err}), so all changes\n\
-                     will be committed in a single commit instead of being refused.\n\
-                     Re-run later (or use `commitor commit --offline`) for an AI split."
+                    "note: the suggested AI split was still inconsistent ({err}).\n\
+                     Falling back to an offline Conventional-Commits split.\n\
+                     (Use `commitor commit --offline` to bypass the AI directly)."
                 );
                 let plan = offline_groups(&collected);
                 return run_offline_plan(plan, &file_diffs, collected.staged_used, &baseline, base_branch.as_deref());
@@ -205,7 +205,14 @@ pub fn run(flags: CommitFlags) -> Result<ExitCode> {
             ))? {
                 RetryDecision::Retry => {
                     println!("Re-requesting an analysis…");
-                    match analysis::analyze_with_mode(&api_key, &collected.patch, "commit", None) {
+                    let retry_context = format!(
+                        "IMPORTANT: Your previous split was rejected because: {err}\n\
+                         Rules to fix this:\n\
+                         - Every changed file and diff hunk must belong to EXACTLY ONE group (no gaps, no duplicates).\n\
+                         - Do NOT assign the same file or hunk to more than one group.\n\
+                         - Use the EXACT full file path as shown in the diff."
+                    );
+                    match analysis::analyze_with_mode(&api_key, &collected.patch, "commit", Some(&retry_context)) {
                         Ok(ok) => {
                             response = ok.0;
                             rate = ok.1;
@@ -746,10 +753,12 @@ fn push_unique(actions: &mut Vec<String>, action: String) {
 }
 
 /// Repair backend group paths that don't match the analyzed diff
-/// verbatim — e.g. the model returned a basename (`analysis.rs`) or a
-/// `./`/`b/` prefix instead of the full path (`crates/cli/src/analysis.rs`).
-/// Falls back to a basename match against the real changed files so a
-/// usable AI split isn't rejected and forced into the offline fallback.
+/// verbatim — e.g. the model returned a basename (`analysis.rs`), a
+/// relative suffix (`services/audio.rs`), or a `./`/`b/` prefix instead
+/// of the full path (`crates/cli/src/analysis.rs`).
+/// Falls back to unambiguous suffix or basename matching against the real
+/// changed files so a usable AI split isn't rejected, while refusing to
+/// arbitrarily pick between multiple files sharing the same basename.
 fn normalize_group_paths(groups: &mut [ChangeGroup], actual: &HashSet<String>) {
     let resolve = |path: &str| -> String {
         if actual.contains(path) {
@@ -762,10 +771,31 @@ fn normalize_group_paths(groups: &mut [ChangeGroup], actual: &HashSet<String>) {
         if actual.contains(cleaned) {
             return cleaned.to_string();
         }
-        let base = cleaned.rsplit('/').next().unwrap_or(cleaned);
-        if let Some(found) = actual.iter().find(|f| f.rsplit('/').next() == Some(base)) {
-            return found.clone();
+
+        // 1. Match as a path suffix with a directory boundary (e.g. "services/audio.rs"
+        // matches "src/services/audio.rs" but not "src/widgets/audio.rs").
+        let suffix_with_slash = format!("/{cleaned}");
+        let suffix_matches: Vec<&String> = actual
+            .iter()
+            .filter(|f| f.ends_with(&suffix_with_slash) || *f == cleaned)
+            .collect();
+        if suffix_matches.len() == 1 {
+            return suffix_matches[0].clone();
         }
+
+        // 2. Basename fallback: only match if UNAMBIGUOUS across the changed set.
+        // If multiple files share the basename (e.g. src/services/mod.rs and
+        // src/widgets/mod.rs), do not pick an arbitrary one, which would cause
+        // duplicate-assignment or missing-file validation failures.
+        let base = cleaned.rsplit('/').next().unwrap_or(cleaned);
+        let base_matches: Vec<&String> = actual
+            .iter()
+            .filter(|f| f.rsplit('/').next() == Some(base))
+            .collect();
+        if base_matches.len() == 1 {
+            return base_matches[0].clone();
+        }
+
         path.to_string()
     };
     for group in groups.iter_mut() {
@@ -1601,6 +1631,59 @@ mod tests {
         assert_eq!(groups[0].files[0], "crates/cli/src/analysis.rs");
         assert_eq!(groups[0].files[1], "crates/cli/src/auth/login.rs");
         assert_eq!(groups[0].partial_files[0].path, "crates/cli/src/analysis.rs");
+    }
+
+    #[test]
+    fn normalize_disambiguates_by_suffix_with_duplicate_basenames() {
+        use crate::analysis::ChangeGroup;
+        let actual: std::collections::HashSet<String> =
+            ["src/services/audio.rs", "src/widgets/audio.rs"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+
+        let mut groups = vec![
+            ChangeGroup {
+                files: vec!["services/audio.rs".to_string()],
+                commit_message: "services".into(),
+                rationale: String::new(),
+                partial_files: vec![],
+            },
+            ChangeGroup {
+                files: vec!["widgets/audio.rs".to_string()],
+                commit_message: "widgets".into(),
+                rationale: String::new(),
+                partial_files: vec![],
+            },
+        ];
+
+        normalize_group_paths(&mut groups, &actual);
+
+        assert_eq!(groups[0].files[0], "src/services/audio.rs");
+        assert_eq!(groups[1].files[0], "src/widgets/audio.rs");
+    }
+
+    #[test]
+    fn normalize_leaves_ambiguous_basenames_unaltered() {
+        use crate::analysis::ChangeGroup;
+        let actual: std::collections::HashSet<String> =
+            ["src/services/mod.rs", "src/widgets/mod.rs"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+
+        let mut groups = vec![ChangeGroup {
+            files: vec!["mod.rs".to_string()],
+            commit_message: "ambiguous".into(),
+            rationale: String::new(),
+            partial_files: vec![],
+        }];
+
+        normalize_group_paths(&mut groups, &actual);
+
+        // Neither should be arbitrarily chosen; path remains "mod.rs" so validation
+        // fails cleanly rather than aliasing one file onto the other.
+        assert_eq!(groups[0].files[0], "mod.rs");
     }
 
     #[test]
