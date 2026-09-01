@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project is in 0.x, minor versions may add, change, or remove
 functionality freely; 1.0.0 marks a stable command surface.
 
+## [0.6.1] — 2026-09-01
+
+### Fixed
+
+- Disambiguate group paths in `commitor commit` using path-suffix matching and unambiguous basename fallback, preventing model shorthand paths from aliasing duplicate basenames across directories.
+- Provide targeted feedback context when retrying inconsistent AI split plans, clarifying exact path and single-group assignment constraints.
+
 ## [0.6.0] — 2026-08-31
 
 ### Added
@@ -228,6 +235,7 @@ not of the full tool.
 - `commitor scan` and `commitor commit` — in active development,
   coming in future 0.x releases.
 
+[0.6.1]: https://github.com/Commitor-AI/commitor/releases/tag/v0.6.1
 [0.6.0]: https://github.com/Commitor-AI/commitor/releases/tag/v0.6.0
 [0.5.1]: https://github.com/Commitor-AI/commitor/releases/tag/v0.5.1
 [0.5.0]: https://github.com/Commitor-AI/commitor/releases/tag/v0.5.0
