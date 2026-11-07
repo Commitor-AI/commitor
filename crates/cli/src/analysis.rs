@@ -28,7 +28,7 @@ const ANALYZE_TIMEOUT_SECS: u64 = 180;
 
 /// Where users upgrade their plan — shown when a free-tier diff is too
 /// large to analyze.
-const PRICING_URL: &str = "https://commitor.dev/pricing";
+const PRICING_URL: &str = "https://commitor.smasduq.xyz/#pro";
 
 /// Free-tier client cap on diff size. The backend enforces its own
 /// `max_length`; we stop just short of that so a free request never
@@ -417,20 +417,18 @@ fn describe_diff_too_large(body: &str) -> String {
             .and_then(|m| m.as_str())
             .map(|m| m.to_string())
             .unwrap_or_else(|| {
-                "This change is too large to analyze on your plan. Upgrade at \
-                 https://commitor.dev/pricing for larger diffs."
-                    .to_string()
+                format!(
+                    "This change is too large to analyze on your plan. Upgrade at {PRICING_URL} for larger diffs."
+                )
             }),
-        Err(_) => {
-            "This change is too large to analyze on your plan. Upgrade at \
-             https://commitor.dev/pricing for larger diffs."
-                .to_string()
-        }
+        Err(_) => format!(
+            "This change is too large to analyze on your plan. Upgrade at {PRICING_URL} for larger diffs."
+        ),
     }
 }
 
 fn describe_rate_limit(body: &str) -> String {
-    let pricing = "https://commitor.dev/pricing";
+    let pricing = PRICING_URL;
     match serde_json::from_str::<serde_json::Value>(body) {
         Ok(v) => {
             let limit = v.get("limit").and_then(|l| l.as_u64());
