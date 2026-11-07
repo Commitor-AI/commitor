@@ -311,9 +311,9 @@ pub fn login_interactive() -> Result<()> {
 /// against a manual key paste and log in with whichever arrives first.
 async fn login_interactive_async() -> Result<()> {
     let redirect = format!("http://127.0.0.1:{CALLBACK_PORT}/callback");
-    let login_url = format!("{FRONTEND_URL}/login?redirect={redirect}");
-    println!("Opening your browser to sign in: {login_url}");
-    let _ = webbrowser::open(&login_url);
+    let connect_url = format!("{FRONTEND_URL}/cli/connect?redirect={redirect}");
+    println!("Opening your browser to authorize this device: {connect_url}");
+    let _ = webbrowser::open(&connect_url);
 
     // Stand up the local callback server when the port is free; otherwise
     // fall back to paste-only.
