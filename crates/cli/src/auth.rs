@@ -22,10 +22,10 @@ use crate::admin;
 use crate::config;
 
 /// Where users manage their keys — shown in error messages.
-pub const DASHBOARD_URL: &str = "https://commitor-web.vercel.app/dashboard";
+pub const DASHBOARD_URL: &str = "https://commitor.smasduq.xyz/dashboard";
 
 /// Production-live frontend used by the browser-based login flow.
-const FRONTEND_URL: &str = "https://commitor-web.vercel.app";
+const FRONTEND_URL: &str = "https://commitor.smasduq.xyz";
 
 /// Local port the CLI listens on for the browser redirect after login.
 const CALLBACK_PORT: u16 = 18745;
