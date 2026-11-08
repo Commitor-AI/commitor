@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project is in 0.x, minor versions may add, change, or remove
 functionality freely; 1.0.0 marks a stable command surface.
 
+## [0.7.0] — 2026-11-08
+
+### Added
+
+- `commitor apply <code>` — redeem a split plan produced by the Commitor PR
+  analysis. It validates the plan against the local checkout, rebuilds the
+  PR's unrelated changes as the analyzer's focused commits on a new
+  `commitor/split-<code>` branch, pushes that branch, and opens a replacement
+  PR against the original base. Your current branch and its history are never
+  rewritten. If no GitHub token is available (`GH_TOKEN`, `GITHUB_TOKEN`, or
+  `gh auth token`), the branch is still pushed and a compare URL is printed.
+- PR split-plan handoff in the GitHub bot: when the analyzer proposes more
+  than one group, the report now includes a copy-paste `commitor apply <code>`
+  block, backed by new account-scoped `/plans` endpoints.
+- Automatic apply refuses PRs containing renames, copies, or submodule changes,
+  and checks the plan against the merge-base diff before mutating anything, so
+  a stale or mismatched plan is rejected cleanly.
+
+### Changed
+
+- Split-plan codes are short-lived (7 days) and single-use; applying one
+  records the replacement PR URL so the same code can't be redeemed twice.
+
 ## [0.6.1] — 2026-09-01
 
 ### Fixed
@@ -235,6 +258,7 @@ not of the full tool.
 - `commitor scan` and `commitor commit` — in active development,
   coming in future 0.x releases.
 
+[0.7.0]: https://github.com/Commitor-AI/commitor/releases/tag/v0.7.0
 [0.6.1]: https://github.com/Commitor-AI/commitor/releases/tag/v0.6.1
 [0.6.0]: https://github.com/Commitor-AI/commitor/releases/tag/v0.6.0
 [0.5.1]: https://github.com/Commitor-AI/commitor/releases/tag/v0.5.1
