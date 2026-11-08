@@ -248,6 +248,51 @@ pub fn create_branch(branch: &str) -> Result<()> {
     run_git(&["checkout", "-b", branch]).map(drop)
 }
 
+/// Machine-readable working-tree status, including untracked files.
+/// `commitor apply` refuses to start on anything less than a fully
+/// clean tree, because it rewrites the index as it splits.
+pub fn worktree_is_clean() -> Result<bool> {
+    let out = run_git(&["status", "--porcelain"])?;
+    Ok(out.trim().is_empty())
+}
+
+/// Resolve a revision to its full object name (`git rev-parse <rev>`).
+pub fn rev_parse(rev: &str) -> Result<String> {
+    run_git(&["rev-parse", rev]).map(|s| s.trim().to_string())
+}
+
+/// The best common ancestor of two revisions (`git merge-base a b`).
+pub fn merge_base(a: &str, b: &str) -> Result<String> {
+    run_git(&["merge-base", a, b]).map(|s| s.trim().to_string())
+}
+
+/// True when a local branch of that name exists.
+pub fn branch_exists(branch: &str) -> Result<bool> {
+    let out = run_git(&["branch", "--list", branch])?;
+    Ok(!out.trim().is_empty())
+}
+
+/// Force-delete a local branch without touching the working tree. Used to
+/// discard the temporary branch created by `commitor apply` when the plan
+/// fails before any commit is made.
+pub fn delete_branch(branch: &str) -> Result<()> {
+    run_git(&["branch", "-D", branch]).map(drop)
+}
+
+/// Fetch one ref from a remote (best-effort at call sites). Keeps the
+/// local `origin/<base>` current before the PR diff is reconstructed.
+pub fn fetch_ref(remote: &str, reference: &str) -> Result<()> {
+    run_git(&["fetch", "--quiet", remote, reference]).map(drop)
+}
+
+/// Reset the index to `rev` while leaving the working tree untouched
+/// (`git reset --mixed <rev>`). Used by `commitor apply` to turn the
+/// PR's committed changes into staged-able working-tree edits on a new
+/// branch, without ever touching the user's original branch.
+pub fn reset_mixed(rev: &str) -> Result<()> {
+    run_git(&["reset", "--mixed", rev]).map(drop)
+}
+
 /// Full SHA of the current HEAD (`git rev-parse HEAD`).
 pub fn head_sha() -> Result<String> {
     run_git(&["rev-parse", "HEAD"]).map(|s| s.trim().to_string())
@@ -364,6 +409,13 @@ pub fn push_current_branch() -> Result<()> {
             .context("cannot push: HEAD is detached, so there is no branch to push")?;
         run_git(&["push", "-u", "origin", &branch]).map(drop)
     }
+}
+
+/// Push a named branch to an explicit remote, setting its upstream to
+/// that ref. `commitor apply` uses this so it can never push to whatever
+/// upstream a freshly created branch may have inherited.
+pub fn push_branch(remote: &str, branch: &str) -> Result<()> {
+    run_git(&["push", "-u", remote, branch]).map(drop)
 }
 
 fn run_git(args: &[&str]) -> Result<String> {

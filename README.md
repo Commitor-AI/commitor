@@ -33,6 +33,7 @@ refused rather than committed.
 | `commitor scan` | Analyze the working diff for unrelated changes (read-only) |
 | `commitor commit` | Split the diff into AI-planned git commits you approve |
 | `commitor commit -b` | As above, but first pick (or create) the branch to commit to |
+| `commitor apply <code>` | Split a mixed PR using the code from its Commitor analysis, then open a replacement PR |
 | `commitor update` | Check GitHub for a newer release and install it |
 | `commitor version` | Print the installed version (`--version`, `-V` also work) |
 | `commitor admin` | Show whether the local admin role is enabled |
@@ -103,6 +104,32 @@ When creating a branch, commitor suggests a name derived from the diff —
 press **Tab** to accept it, type your own name, or **Ctrl-C** to skip the
 picker and commit on the current branch.
 
+### Applying a PR split
+
+When the Commitor PR analysis finds that a pull request bundles unrelated
+changes, the review comment includes a short code like
+`ABCD-EFGH-JKLM`. Check out the PR's branch in a clean working tree, then
+paste the code:
+
+```sh
+git checkout feature/login-flow
+commitor apply ABCD-EFGH-JKLM
+```
+
+`commitor apply` fetches the plan, verifies that your checkout matches the
+analyzed PR, and shows the proposed commits. On approval it creates a new
+branch (`commitor/split-<code>`), rebuilds the PR's changes as the planned
+focused commits, and opens a replacement PR against the original base
+branch. Your current branch and its history are never rewritten.
+
+Opening the PR needs a GitHub token in `GH_TOKEN` or `GITHUB_TOKEN`, or a
+stored `gh auth login` session. Without one, the branch is still pushed and
+commitor prints a compare URL you can open in the browser.
+
+Automatic apply refuses renames, copies, and submodule changes — split
+those by hand. Each code can be applied once; re-run the PR analysis if you
+need a fresh one.
+
 `scan` and `commit` need a backend account (`commitor login --key <key>` —
 get a key at [commitor.dev/dashboard](https://commitor.dev/dashboard)).
 `scan` only calls the backend when local heuristics can't confidently call
@@ -163,6 +190,7 @@ before replacing its own binary.
 - Hunk-level splitting for exotic paths (quoted/escaped filenames are
   currently refused rather than split)
 - PR-review command (`commitor pr`) comparing a branch against its base
+- Automatic apply for PRs containing renames, copies, or submodule changes
 
 ## License
 

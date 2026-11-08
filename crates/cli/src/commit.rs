@@ -759,7 +759,7 @@ fn push_unique(actions: &mut Vec<String>, action: String) {
 /// Falls back to unambiguous suffix or basename matching against the real
 /// changed files so a usable AI split isn't rejected, while refusing to
 /// arbitrarily pick between multiple files sharing the same basename.
-fn normalize_group_paths(groups: &mut [ChangeGroup], actual: &HashSet<String>) {
+pub(crate) fn normalize_group_paths(groups: &mut [ChangeGroup], actual: &HashSet<String>) {
     let resolve = |path: &str| -> String {
         if actual.contains(path) {
             return path.to_string();
@@ -811,7 +811,7 @@ fn normalize_group_paths(groups: &mut [ChangeGroup], actual: &HashSet<String>) {
 /// Map backend groups onto executable plan groups: `partial_files`
 /// become hunk claims; `files` stay whole unless that path is split
 /// somewhere in the plan (validator catches real ambiguity).
-fn build_plan(groups: &[ChangeGroup]) -> Vec<PlanGroup> {
+pub(crate) fn build_plan(groups: &[ChangeGroup]) -> Vec<PlanGroup> {
     let partially_claimed: HashSet<&str> = groups
         .iter()
         .flat_map(|group| group.partial_files.iter().map(|pf| pf.path.as_str()))
@@ -888,7 +888,7 @@ fn commit_single(
         }
     }
 
-    execute_commits(plan, file_diffs, staged_used, baseline, base_branch)
+    execute_commits(plan, file_diffs, staged_used, baseline, base_branch, true)
 }
 
 /// Multiple groups → show the proposed split and commit each group in
@@ -951,12 +951,12 @@ fn commit_split(
         }
     }
 
-    execute_commits(plan, file_diffs, staged_used, baseline, base_branch)
+    execute_commits(plan, file_diffs, staged_used, baseline, base_branch, true)
 }
 
 /// One line listing a group's contents: whole paths plain, partial
 /// ones annotated with their hunk numbers.
-fn describe_group(group: &PlanGroup) -> String {
+pub(crate) fn describe_group(group: &PlanGroup) -> String {
     let mut parts: Vec<String> = group.whole.clone();
     for (path, hunk_ids) in &group.partial {
         parts.push(format!("{} (hunks {})", path, join_ids(hunk_ids)));
@@ -1001,12 +1001,13 @@ fn edit_plan_messages(plan: &mut [PlanGroup]) {
 /// No automatic rollback on failure — history already written stays,
 /// and everything not yet committed is reported below so `git status`
 /// / `git log` tell the user exactly where things stand.
-fn execute_commits(
+pub(crate) fn execute_commits(
     plan: &mut [PlanGroup],
     file_diffs: &[FileDiff],
     staged_used: bool,
     baseline: &str,
     base_branch: Option<&str>,
+    push: bool,
 ) -> Result<ExitCode> {
     // Final sanity check immediately before mutating anything.
     ensure_tree_unchanged(baseline)?;
@@ -1103,8 +1104,10 @@ fn execute_commits(
     }
 
     // Offer to push the result upstream; never fatal to the commit itself.
-    if let Err(err) = maybe_push() {
-        eprintln!("warning: didn't push — {err:#}");
+    if push {
+        if let Err(err) = maybe_push() {
+            eprintln!("warning: didn't push — {err:#}");
+        }
     }
 
     Ok(ExitCode::SUCCESS)

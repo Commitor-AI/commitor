@@ -495,7 +495,7 @@ pub struct AnalyzeResponse {
     pub branch_name: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChangeGroup {
     /// The file paths wholly belonging to this logical change. Paths
     /// that are split hunk-wise appear in `partial_files` instead.

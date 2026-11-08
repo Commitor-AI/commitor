@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 
 mod admin;
 mod analysis;
+mod apply;
 mod auth;
 mod changelog;
 mod commit;
@@ -81,9 +82,16 @@ enum Commands {
         #[arg(short = 'b')]
         branch: bool,
     },
+    /// Apply a split plan produced by the Commitor PR analysis: create a
+    /// new branch that separates the PR's unrelated changes into focused
+    /// commits, then open a replacement PR
+    Apply {
+        /// The code from the PR analysis, e.g. `ABCD-EFGH-JKLM`
+        #[arg(value_name = "CODE")]
+        code: String,
+    },
     /// Undo commits made by a previous `commitor commit` run
-    Revert {
-        /// Show the last N sessions instead of reverting the most recent
+    Revert {        /// Show the last N sessions instead of reverting the most recent
         #[arg(long)]
         list: bool,
         /// Skip the working-tree-dirty safety check (use with care — a
@@ -173,6 +181,7 @@ fn is_server_facing(command: &Commands) -> bool {
             | Commands::Whoami
             | Commands::Scan { .. }
             | Commands::Commit { .. }
+            | Commands::Apply { .. }
     )
 }
 
@@ -206,6 +215,7 @@ fn execute(command: Commands) -> Result<ExitCode, Option<anyhow::Error>> {
         Commands::Commit { all, offline, branch } => {
             commit::run(commit::CommitFlags { all, offline, branch }).map_err(Some)
         }
+        Commands::Apply { code } => apply::run(code).map_err(Some),
         Commands::Revert {
             list,
             force,
